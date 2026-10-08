@@ -1,0 +1,1487 @@
+// RECONOCIMIENTO FACIAL - VERSIÓN CORREGIDA (v3)
+// Emgu.CV 4.8.0.5324 | YuNet (detección) + SFace (reconocimiento) | XIAO ESP32S3 (stream MJPEG)
+// SQL Server para persistencia de asistencia y plantillas biométricas.
+//
+// CONTROLES REQUERIDOS EN EL DISEÑADOR (agregarlos a mano, ver instrucciones del chat):
+//   DataGridView dgvAlumnos | TextBox txtBuscar | Button btnBuscar | Button btnRegistrar
+//   Button btnBorrarTodo | Button btnGuardarEdiciones | Button btnEliminarSeleccionado
+//   Button btnActualizarGrilla
+//
+// Cambios respecto a la versión anterior:
+//   - Se reemplazaron las teclas ESPACIO/SUPR por botones (btnRegistrar / btnBorrarTodo).
+//   - btnBorrarTodo pide confirmación DOS veces antes de borrar.
+//   - Persistencia en SQL Server: al registrar, la plantilla se guarda en la base; al reconocer,
+//     se marca "Presente" con fecha/hora; al iniciar el programa, se recargan todos los registros.
+//   - Panel de administración: grilla editable (Nombre/Apellido/Legajo), búsqueda y borrado individual.
+//   - Si SQL Server no está disponible, el programa sigue funcionando solo en memoria (no bloquea
+//     las pruebas de reconocimiento) y lo avisa en el log.
+
+using Emgu.CV;
+using Emgu.CV.CvEnum;
+using Emgu.CV.Face;
+using Emgu.CV.Structure;
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace Proyecto_ReconocimientoFacial_0._1
+{
+    public partial class Form1 : Form
+    {
+        // ------------------------------------------------------------------
+        // PARÁMETROS AJUSTABLES
+        // ------------------------------------------------------------------
+        private const float UMBRAL_SFACE = 0.363f;        // Similitud coseno mínima (valor recomendado por OpenCV)
+        private const float MARGEN_AMBIGUO = 0.08f;       // Diferencia mínima entre 1er y 2do candidato para confiar
+        private const float SCORE_DETECCION = 0.7f;       // Confianza mínima de YuNet para considerar un rostro
+        private const float SCORE_REGISTRO = 0.9f;        // Confianza exigida al REGISTRAR
+        private const int MIN_LADO_RECONOCER = 50;        // Lado mínimo (px, resolución original) para reconocer
+        private const int MIN_LADO_REGISTRO = 70;         // Lado mínimo (px, resolución original) para registrar
+        private const int MARGEN_BORDE = 4;               // Margen (px) al borde: rostro cortado = alineación mala
+        private const double UMBRAL_NITIDEZ = 40.0;       // Varianza del Laplaciano (ajústala con los valores del log)
+        private const double BRILLO_MIN = 50.0;           // Media de gris (0-255) mínima: por debajo, a contraluz
+        private const double BRILLO_MAX = 210.0;          // Media de gris (0-255) máxima: por encima, luz directa
+        private const double ASIMETRIA_MAX = 45.0;        // Diferencia de brillo izq/der máxima: por encima, contraluz lateral
+        private const float UMBRAL_CONSISTENCIA = 0.40f;  // Las muestras del registro deben parecerse a la primera
+        private const int MUESTRAS_REGISTRO = 5;          // Muestras por persona
+        private const int MS_ENTRE_MUESTRAS = 300;        // Separación entre muestras
+        private const int MS_TIMEOUT_REGISTRO = 10000;    // Tiempo máximo para completar un registro
+        private const int VENTANA_VOTOS = 7;              // Fotogramas usados para confirmar identidad
+        private const int VOTOS_MINIMOS = 4;              // Coincidencias necesarias dentro de la ventana
+        private const int MAX_PERSONAS = 4;
+        private const int ESCALA_MAX_DETECCION = 640;     // Lado máximo (px) para correr YuNet; frames mayores se reducen
+        private const string ESTADO_ANALIZANDO = "Analizando...";
+        private const string ESTADO_AMBIGUO = "Verificando...";
+
+        // Cámara ESP32 - debe coincidir EXACTO con la IP fija que pusiste en el .ino (local_IP).
+        // Si volvés a cambiar la IP fija en el firmware, actualizala también acá.
+        private readonly string ipCamara = "192.168.1.110";
+        private readonly string streamUrl;
+        private readonly string tempUrl;
+        private readonly TimeSpan intervaloTemp = TimeSpan.FromSeconds(20);
+        private const double TEMP_ADVERTENCIA_C = 70.0;
+
+        // SQL Server - cambiar "servidorSql" por el nombre que ves al conectar en SSMS
+        private readonly string servidorSql = "LUX\\SQLEXPRESS"; // ej: "DESKTOP-ABC123\\SQLEXPRESS" o "localhost"
+        private readonly string baseDeDatosSql = "FaceTrackAttendance";
+        private AdministradorSQL administradorSQL;
+        private volatile bool sqlDisponible = false;
+
+        // ------------------------------------------------------------------
+        // ESTADO
+        // ------------------------------------------------------------------
+        private FaceDetectorYN detectorNet;
+        private FaceRecognizerSF recognizerNet;
+
+        // Protege redes, listaPersonas y el estado del registro (solo los toca el hilo de procesamiento y el cierre)
+        private readonly object lockObjetosNativos = new object();
+        private volatile bool isDisposing = false;
+
+        private readonly List<PersonaRegistrada> listaPersonas = new List<PersonaRegistrada>();
+
+        // Registro multi-muestra
+        private volatile bool solicitudRegistro = false;
+        private volatile bool solicitudBorrado = false;
+        private volatile bool registroActivo = false;
+        private readonly List<Mat> muestrasRegistro = new List<Mat>();
+        private DateTime inicioRegistro = DateTime.MinValue;
+        private DateTime ultimaMuestra = DateTime.MinValue;
+
+        // Confirmación temporal de identidad
+        private readonly Queue<KeyValuePair<string, double>> ultimosVotos = new Queue<KeyValuePair<string, double>>();
+        private DateTime ultimoRostroVisto = DateTime.MinValue;
+
+        // Notificaciones con cooldown
+        private string ultimoSujetoNotificado = "";
+        private DateTime ultimaNotificacion = DateTime.MinValue;
+        private readonly TimeSpan cooldownNotificacion = TimeSpan.FromSeconds(5);
+
+        // Último estado mostrado (evita inundar la interfaz)
+        private string ultimoEstado = "";
+        private DateTime ultimoEstadoTs = DateTime.MinValue;
+
+        // Buffer del último fotograma (red -> procesamiento)
+        private readonly object lockFrame = new object();
+        private byte[] ultimoJpeg;
+        private readonly AutoResetEvent nuevoFrame = new AutoResetEvent(false);
+        private static readonly byte[] SOI = { 0xFF, 0xD8 };
+        private static readonly byte[] EOI = { 0xFF, 0xD9 };
+
+        private CancellationTokenSource cancellationTokenSource;
+        private Size ultimoTamanoDeteccion = Size.Empty;
+        private int frameUIPendiente = 0; // 1 = la interfaz aún no terminó de pintar el fotograma anterior
+        private bool formCargado = false;
+
+        // Contador para nombrar "Sujeto N" SOLO cuando SQL no está disponible. A propósito NUNCA se basa en
+        // listaPersonas.Count: si se basara en el conteo actual, borrar a alguien y registrar a otra persona
+        // podía reciclar un nombre ya usado (el bug de "dos Sujeto 2" que viste). Este contador solo sube.
+        private int proximoIdLocalFallback = 0;
+
+        private static readonly MCvScalar COLOR_VERDE = new MCvScalar(0, 255, 0);
+        private static readonly MCvScalar COLOR_ROJO = new MCvScalar(0, 0, 255);
+        private static readonly MCvScalar COLOR_AMARILLO = new MCvScalar(0, 255, 255);
+        private static readonly MCvScalar COLOR_AZUL = new MCvScalar(255, 128, 0);
+
+        // Historial de temperatura para el gráfico (reemplaza el log de texto repetitivo)
+        private readonly object lockHistorialTemp = new object();
+        private readonly List<(DateTime Hora, double Temp)> historialTemperatura = new List<(DateTime, double)>();
+        private const int MAX_PUNTOS_TEMP = 30; // a 20s cada uno, ~10 minutos de historial visible
+
+        // Panel de estado de conexión (IP fija + indicador verde/rojo). Los colores viven en Estetica.
+        private DateTime ultimoFrameRecibido = DateTime.MinValue;
+        private System.Windows.Forms.Timer timerEstadoConexion;
+
+        public Form1()
+        {
+            InitializeComponent();
+
+            streamUrl = $"http://{ipCamara}:81/stream";
+            tempUrl = $"http://{ipCamara}/temp";
+
+            this.Load += Form1_Load;
+            this.FormClosing += Form1_FormClosing;
+
+            Estetica.AplicarEstilo(this);
+
+            // El PictureBox se ajusta al tamaño que le diste en el diseñador, sin importar la
+            // resolución real de la cámara (esto es lo que resuelve el desborde con FRAMESIZE_HVGA).
+            // Esto queda en Form1 porque es parte de cómo se muestra el stream, no de la paleta visual.
+            pictureBox1.SizeMode = PictureBoxSizeMode.Zoom;
+            pictureBox1.BorderStyle = BorderStyle.FixedSingle;
+
+            // Enganchá estos métodos a los eventos Click de los botones desde el Designer
+            // (o descomentá estas líneas si preferís engancharlos acá):
+            // btnRegistrar.Click += btnRegistrar_Click;
+            // btnBorrarTodo.Click += btnBorrarTodo_Click;
+            // btnBuscar.Click += btnBuscar_Click;
+            // btnGuardarEdiciones.Click += btnGuardarEdiciones_Click;
+            // btnEliminarSeleccionado.Click += btnEliminarSeleccionado_Click;
+            // btnActualizarGrilla.Click += btnActualizarGrilla_Click;
+            // panelTemperatura.Paint += panelTemperatura_Paint;
+        }
+
+        // ------------------------------------------------------------------
+        // CARGA
+        // ------------------------------------------------------------------
+        private void Form1_Load(object sender, EventArgs e)
+        {
+            if (formCargado) return;
+            formCargado = true;
+
+            textBox1.Text = "ESPERANDO DETECCIÓN..." + Environment.NewLine;
+            textBox2.Text = "=== DATOS BIOMÉTRICOS ===" + Environment.NewLine;
+            LogMensaje("=== LOGS DE CONEXIÓN ESP32 ===");
+            LogMensaje("Usá el botón 'Registrar' para capturar un rostro y 'Borrar todo' para reiniciar la lista.");
+
+            try
+            {
+                string pathDetector = BuscarModelo("face_detection_yunet_2023mar.onnx");
+                string pathRecognizer = BuscarModelo("face_recognition_sface_2021dec.onnx");
+
+                if (pathDetector == null || pathRecognizer == null)
+                {
+                    LogMensaje("[ERROR ONNX] Archivos de modelo .onnx no encontrados.");
+                    MessageBox.Show("No se encontraron los archivos de modelos ONNX.\n" +
+                                    "Cópialos junto al .exe o en la carpeta 'models' " +
+                                    "(Propiedades > Copiar en el directorio de salida > Copiar si es posterior).",
+                                    "Error de Archivo", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                detectorNet = new FaceDetectorYN(
+                    model: pathDetector,
+                    config: "",
+                    inputSize: new Size(320, 320),
+                    scoreThreshold: SCORE_DETECCION,
+                    nmsThreshold: 0.3f,
+                    topK: 5000,
+                    backendId: Emgu.CV.Dnn.Backend.OpenCV,
+                    targetId: Emgu.CV.Dnn.Target.Cpu
+                );
+
+                recognizerNet = new FaceRecognizerSF(
+                    model: pathRecognizer,
+                    config: "",
+                    backendId: Emgu.CV.Dnn.Backend.OpenCV,
+                    targetId: Emgu.CV.Dnn.Target.Cpu
+                );
+
+                LogMensaje("[OK] Modelos ONNX cargados correctamente.");
+            }
+            catch (Exception ex)
+            {
+                LogMensaje($"[ERROR ONNX] Fallo al cargar modelos: {ex.Message}");
+                return;
+            }
+
+            InicializarSql();
+
+            // El ping es solo informativo y no bloquea la interfaz ni impide conectar
+            Task.Run(() =>
+            {
+                try
+                {
+                    using (Ping ping = new Ping())
+                    {
+                        PingReply reply = ping.Send(ipCamara, 2000);
+                        if (reply != null && reply.Status == IPStatus.Success)
+                            LogMensaje($"[OK] Ping exitoso a {ipCamara} ({reply.RoundtripTime} ms).");
+                        else
+                            LogMensaje($"[AVISO] Sin respuesta al ping de {ipCamara} (se intentará conectar igual).");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogMensaje($"[AVISO] Ping falló: {ex.Message}");
+                }
+            });
+
+            LogMensaje($"Conectando a {streamUrl} ...");
+            IniciarStreamCamara();
+            IniciarSondeoTemperatura();
+            IniciarMonitorConexion();
+        }
+
+        private static string BuscarModelo(string archivo)
+        {
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            string[] candidatos =
+            {
+                Path.Combine(baseDir, archivo),
+                Path.Combine(baseDir, "models", archivo),
+                archivo,
+                Path.Combine("models", archivo)
+            };
+            return candidatos.FirstOrDefault(File.Exists);
+        }
+
+
+
+        // ------------------------------------------------------------------
+        // SQL SERVER
+        // ------------------------------------------------------------------
+        private void InicializarSql()
+        {
+            try
+            {
+                administradorSQL = new AdministradorSQL(servidorSql, baseDeDatosSql);
+                administradorSQL.AsegurarBaseDeDatos();
+                administradorSQL.AsegurarEsquema();
+                sqlDisponible = true;
+                LogMensaje("[OK] Conectado a SQL Server.");
+
+                CargarPersonasDesdeSql();
+                ActualizarGrilla();
+            }
+            catch (Exception ex)
+            {
+                sqlDisponible = false;
+                LogMensaje($"[AVISO] SQL Server no disponible: {ex.Message}");
+                LogMensaje("[AVISO] Se sigue trabajando solo en memoria (sin persistencia).");
+            }
+        }
+
+        // Recupera las plantillas guardadas en SQL para no perder los registros al reiniciar el programa
+        private void CargarPersonasDesdeSql()
+        {
+            if (!sqlDisponible) return;
+
+            foreach (var item in administradorSQL.ObtenerPlantillas())
+            {
+                float[] valores = BytesAVector(item.Plantilla);
+                Mat centroide = new Mat(1, valores.Length, DepthType.Cv32F, 1);
+                centroide.SetTo(valores);
+
+                listaPersonas.Add(new PersonaRegistrada
+                {
+                    Id = item.Id,
+                    IdBd = item.Id,
+                    Nombre = item.Nombre,
+                    Plantilla = centroide
+                });
+            }
+
+            if (listaPersonas.Count > 0)
+                LogMensaje($"[OK] {listaPersonas.Count} persona(s) cargada(s) desde SQL Server.");
+        }
+
+        // Refresca la grilla del panel de administración (siempre desde el hilo de UI)
+        private void ActualizarGrilla()
+        {
+            if (!sqlDisponible) return;
+
+            EjecutarEnUI(() =>
+            {
+                try
+                {
+                    DataTable tabla = administradorSQL.ObtenerTodos();
+                    dgvAlumnos.DataSource = tabla;
+                    dgvAlumnos.AllowUserToAddRows = false; // sin esto, la fila en blanco del final intenta crear un alumno sin Plantilla
+
+                    if (dgvAlumnos.Columns["Id"] != null) dgvAlumnos.Columns["Id"].ReadOnly = true;
+                    if (dgvAlumnos.Columns["Estado"] != null) dgvAlumnos.Columns["Estado"].ReadOnly = true;
+                    if (dgvAlumnos.Columns["FechaHora"] != null) dgvAlumnos.Columns["FechaHora"].ReadOnly = true;
+                }
+                catch (Exception ex)
+                {
+                    LogMensaje($"[AVISO] No se pudo actualizar la grilla: {ex.Message}");
+                }
+            });
+        }
+
+        private static byte[] VectorABytes(float[] v)
+        {
+            byte[] b = new byte[v.Length * sizeof(float)];
+            Buffer.BlockCopy(v, 0, b, 0, b.Length);
+            return b;
+        }
+
+        private static float[] BytesAVector(byte[] b)
+        {
+            float[] v = new float[b.Length / sizeof(float)];
+            Buffer.BlockCopy(b, 0, v, 0, b.Length);
+            return v;
+        }
+
+        private static float[] ValoresDeMat(Mat m)
+        {
+            float[] v = new float[m.Cols];
+            m.CopyTo(v);
+            return v;
+        }
+
+        // ---- Botones del panel de administración ----
+
+        private void btnRegistrar_Click(object sender, EventArgs e)
+        {
+            if (!registroActivo) solicitudRegistro = true;
+        }
+
+        private void btnBorrarTodo_Click(object sender, EventArgs e)
+        {
+            DialogResult r1 = MessageBox.Show(
+                "Esto borrará TODOS los rostros registrados, tanto en memoria como en SQL Server.\n¿Deseas continuar?",
+                "Confirmar borrado", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (r1 != DialogResult.Yes) return;
+
+            DialogResult r2 = MessageBox.Show(
+                "Esta acción NO se puede deshacer.\n¿Confirmás que querés borrar todos los registros ahora?",
+                "Última confirmación", MessageBoxButtons.YesNo, MessageBoxIcon.Error);
+            if (r2 != DialogResult.Yes) return;
+
+            solicitudBorrado = true;
+        }
+
+        private void btnActualizarGrilla_Click(object sender, EventArgs e)
+        {
+            ActualizarGrilla();
+        }
+
+        private void btnBuscar_Click(object sender, EventArgs e)
+        {
+            if (!sqlDisponible) { MostrarEstado("SQL Server no está disponible."); return; }
+
+            try
+            {
+                DataTable tabla = administradorSQL.Buscar(txtBuscar.Text);
+                dgvAlumnos.DataSource = tabla;
+            }
+            catch (Exception ex)
+            {
+                LogMensaje($"[AVISO] Error en la búsqueda: {ex.Message}");
+            }
+        }
+
+        private void btnGuardarEdiciones_Click(object sender, EventArgs e)
+        {
+            if (!sqlDisponible) { MostrarEstado("SQL Server no está disponible."); return; }
+
+            try
+            {
+                DataTable tabla = dgvAlumnos.DataSource as DataTable;
+                if (tabla == null) return;
+
+                // BUG CORREGIDO: antes se podían guardar dos alumnos con el mismo Nombre+Apellido
+                // (ej. dos "Lucía") sin ningún aviso, lo cual hacía imposible saber a cuál se estaba
+                // reconociendo en el video. Se valida ANTES de guardar, no después.
+                string duplicado = BuscarNombreDuplicado(tabla);
+                if (duplicado != null)
+                {
+                    MessageBox.Show($"Hay más de un alumno con el nombre \"{duplicado}\" (mismo Nombre y Apellido).\n" +
+                                    "Corregilo antes de guardar para no confundir a quién reconoce la cámara.",
+                                    "Nombre duplicado", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                administradorSQL.GuardarEdiciones(tabla);
+
+                // BUG CORREGIDO: renombrar en la grilla NO actualizaba el nombre que usa el reconocimiento
+                // en vivo (listaPersonas), porque son dos listas separadas. El video seguía mostrando el
+                // nombre viejo hasta reiniciar el programa. Ahora se sincronizan en el mismo momento.
+                SincronizarNombresEnMemoria(tabla);
+
+                MostrarEstado("Cambios guardados en SQL Server.");
+                ActualizarGrilla();
+            }
+            catch (Exception ex)
+            {
+                LogMensaje($"[ERROR] No se pudieron guardar los cambios: {ex.Message}");
+            }
+        }
+
+        // Busca si hay dos o más filas con el mismo Nombre+Apellido (comparación sin mayúsculas/espacios).
+        // Devuelve el nombre en conflicto, o null si no hay duplicados.
+        private string BuscarNombreDuplicado(DataTable tabla)
+        {
+            var grupos = tabla.AsEnumerable()
+                .Select(f => new
+                {
+                    Clave = ((f["Nombre"]?.ToString() ?? "") + "|" + (f["Apellido"]?.ToString() ?? "")).Trim().ToLowerInvariant(),
+                    Nombre = f["Nombre"]?.ToString() ?? ""
+                })
+                .Where(x => x.Clave.Replace("|", "").Length > 0) // ignora filas sin nombre
+                .GroupBy(x => x.Clave);
+
+            var conflicto = grupos.FirstOrDefault(g => g.Count() > 1);
+            return conflicto?.First().Nombre;
+        }
+
+        // Actualiza el Nombre en memoria de cada PersonaRegistrada activa, para que el video y los logs
+        // reflejen al instante lo que acabás de guardar en la grilla (sin esperar a reiniciar el programa).
+        private void SincronizarNombresEnMemoria(DataTable tabla)
+        {
+            lock (lockObjetosNativos)
+            {
+                foreach (DataRow fila in tabla.Rows)
+                {
+                    int id = Convert.ToInt32(fila["Id"]);
+                    PersonaRegistrada persona = listaPersonas.FirstOrDefault(p => p.IdBd == id);
+                    if (persona != null) persona.Nombre = fila["Nombre"]?.ToString() ?? persona.Nombre;
+                }
+            }
+        }
+
+        private void btnEliminarSeleccionado_Click(object sender, EventArgs e)
+        {
+            if (!sqlDisponible) { MostrarEstado("SQL Server no está disponible."); return; }
+            if (dgvAlumnos.CurrentRow == null) return;
+
+            int id = Convert.ToInt32(dgvAlumnos.CurrentRow.Cells["Id"].Value);
+            DialogResult r = MessageBox.Show($"¿Eliminar el registro Id {id}?", "Confirmar eliminación",
+                                             MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (r != DialogResult.Yes) return;
+
+            try
+            {
+                administradorSQL.EliminarSujeto(id);
+
+                lock (lockObjetosNativos)
+                {
+                    PersonaRegistrada p = listaPersonas.FirstOrDefault(x => x.IdBd == id);
+                    if (p != null)
+                    {
+                        listaPersonas.Remove(p);
+                        p.Dispose();
+                    }
+                }
+
+                ActualizarGrilla();
+            }
+            catch (Exception ex)
+            {
+                LogMensaje($"[ERROR] No se pudo eliminar: {ex.Message}");
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // UTILIDADES DE INTERFAZ
+        // ------------------------------------------------------------------
+        // ------------------------------------------------------------------
+        // PANEL DE ESTADO DE CONEXIÓN
+        // ------------------------------------------------------------------
+        // Requiere en el Designer: Label "lblIP", Label "lblIndicadorConexion" (el puntito de color),
+        // Label "lblEstadoConexion" (el texto "Conectado"/"Desconectado").
+        //
+        // No se basa solo en si hubo una excepción de red: si el stream se cuelga sin tirar error
+        // todavía, esto lo detecta igual porque mide cuánto hace que NO llega un fotograma nuevo.
+        private void IniciarMonitorConexion()
+        {
+            lblIP.Text = $"XIAO: {ipCamara}";
+            Estetica.EstilizarIndicadorConexion(lblIndicadorConexion);
+            lblIndicadorConexion.ForeColor = Estetica.ColorPeligro;
+            lblEstadoConexion.Text = "Desconectado";
+
+            timerEstadoConexion = new System.Windows.Forms.Timer { Interval = 2000 };
+            timerEstadoConexion.Tick += (s, e) =>
+            {
+                bool conectado = ultimoFrameRecibido != DateTime.MinValue &&
+                                 (DateTime.Now - ultimoFrameRecibido) < TimeSpan.FromSeconds(5);
+
+                lblIndicadorConexion.ForeColor = conectado ? Estetica.ColorExito : Estetica.ColorPeligro;
+                lblEstadoConexion.Text = conectado ? "Conectado" : "Desconectado";
+            };
+            timerEstadoConexion.Start();
+        }
+
+        // ------------------------------------------------------------------
+        // GRÁFICO DE TEMPERATURA
+        // ------------------------------------------------------------------
+        // Requiere en el Designer: un Panel llamado "panelTemperatura" con su evento Paint
+        // enganchado a panelTemperatura_Paint (doble clic en el Designer sobre el evento Paint,
+        // o descomentar la línea en el constructor). Form1 solo junta los datos (el historial);
+        // quién y cómo se dibuja el gráfico vive en Estetica.
+        private void panelTemperatura_Paint(object sender, PaintEventArgs e)
+        {
+            List<(DateTime Hora, double Temp)> datos;
+            lock (lockHistorialTemp) datos = new List<(DateTime, double)>(historialTemperatura);
+
+            Estetica.DibujarGraficoTemperatura(e.Graphics, panelTemperatura.ClientRectangle, datos);
+        }
+
+        private void EjecutarEnUI(Action accion)
+        {
+            if (isDisposing || IsDisposed || !IsHandleCreated) return;
+            try { BeginInvoke(accion); }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }
+
+        private void LogMensaje(string mensaje)
+        {
+            if (isDisposing || IsDisposed) return;
+
+            if (InvokeRequired)
+            {
+                EjecutarEnUI(() => LogMensaje(mensaje));
+                return;
+            }
+
+            string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
+            textBox3.AppendText($"[{timestamp}] {mensaje}{Environment.NewLine}");
+        }
+
+        // Estado de registro/lectura en textBox1 (con antirrebote para no saturar la UI)
+        private void MostrarEstado(string mensaje)
+        {
+            DateTime ahora = DateTime.Now;
+            if (mensaje == ultimoEstado && (ahora - ultimoEstadoTs).TotalMilliseconds < 1000) return;
+
+            ultimoEstado = mensaje;
+            ultimoEstadoTs = ahora;
+
+            string texto = $"[{ahora:HH:mm:ss}] {mensaje}";
+            EjecutarEnUI(() => { textBox1.Text = texto; });
+        }
+
+        // ------------------------------------------------------------------
+        // TEMPERATURA DEL XIAO (sondeo periódico, no por fotograma)
+        // ------------------------------------------------------------------
+        private void IniciarSondeoTemperatura()
+        {
+            CancellationToken token = cancellationTokenSource.Token;
+
+            Task.Run(async () =>
+            {
+                while (!token.IsCancellationRequested && !isDisposing)
+                {
+                    try { await Task.Delay(intervaloTemp, token); }
+                    catch (TaskCanceledException) { break; }
+
+                    await ConsultarTemperaturaEsp32();
+                }
+            }, token);
+        }
+
+        private async Task ConsultarTemperaturaEsp32()
+        {
+            try
+            {
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(tempUrl);
+                request.Timeout = 3000;
+                request.Method = "GET";
+
+                using (HttpWebResponse response = (HttpWebResponse)await request.GetResponseAsync())
+                using (Stream stream = response.GetResponseStream())
+                using (StreamReader reader = new StreamReader(stream))
+                {
+                    string texto = (await reader.ReadToEndAsync()).Trim();
+
+                    if (double.TryParse(texto, System.Globalization.NumberStyles.Float,
+                                        System.Globalization.CultureInfo.InvariantCulture, out double temp))
+                    {
+                        // Se reemplaza el log de texto por fotograma (molesto al ir mirando el historial)
+                        // por el gráfico: cada lectura se guarda con su hora y se pide un repintado.
+                        lock (lockHistorialTemp)
+                        {
+                            historialTemperatura.Add((DateTime.Now, temp));
+                            while (historialTemperatura.Count > MAX_PUNTOS_TEMP) historialTemperatura.RemoveAt(0);
+                        }
+                        EjecutarEnUI(() => panelTemperatura.Invalidate());
+
+                        if (temp >= TEMP_ADVERTENCIA_C)
+                            LogMensaje($"[AVISO] Temperatura del XIAO alta ({temp:F1} °C). Verifica ventilación.");
+                    }
+                    else
+                    {
+                        LogMensaje($"[TEMP XIAO] Respuesta no numérica: '{texto}'");
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // El endpoint /temp puede no existir todavía en el firmware: no se satura el log con esto.
+                System.Diagnostics.Debug.WriteLine("[TEMP XIAO] Endpoint no disponible o sin respuesta.");
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // RED: LECTURA DEL STREAM MJPEG
+        // ------------------------------------------------------------------
+        private void IniciarStreamCamara()
+        {
+            cancellationTokenSource = new CancellationTokenSource();
+            CancellationToken token = cancellationTokenSource.Token;
+
+            Task.Factory.StartNew(() => CaptureMjpegStream(streamUrl, token), token,
+                                  TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            Task.Factory.StartNew(() => BucleProcesamiento(token), token,
+                                  TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+
+        private void CaptureMjpegStream(string url, CancellationToken token)
+        {
+            byte[] buffer = new byte[1024 * 512];
+
+            while (!token.IsCancellationRequested && !isDisposing)
+            {
+                HttpWebRequest request = null;
+                HttpWebResponse response = null;
+                CancellationTokenRegistration registro = default(CancellationTokenRegistration);
+
+                try
+                {
+                    request = (HttpWebRequest)WebRequest.Create(url);
+                    request.Timeout = 10000;
+                    request.ReadWriteTimeout = 8000;   // si la ESP32 se cuelga, se reconecta en vez de bloquearse para siempre
+                    request.KeepAlive = false;
+                    request.AllowReadStreamBuffering = false;
+
+                    HttpWebRequest reqLocal = request;
+                    registro = token.Register(() => { try { reqLocal.Abort(); } catch { } }); // desbloquea Read() al cerrar
+
+                    response = (HttpWebResponse)request.GetResponse();
+
+                    using (Stream stream = response.GetResponseStream())
+                    {
+                        if (stream == null) throw new IOException("Respuesta sin flujo de datos.");
+
+                        LogMensaje("[ÉXITO] Transmisión activa.");
+                        int readOffset = 0;
+
+                        while (!token.IsCancellationRequested && !isDisposing)
+                        {
+                            int bytesRead = stream.Read(buffer, readOffset, buffer.Length - readOffset);
+                            if (bytesRead <= 0) break;
+
+                            readOffset += bytesRead;
+                            readOffset = ExtraerFrames(buffer, readOffset);
+                        }
+                    }
+
+                    token.WaitHandle.WaitOne(500); // el servidor cerró la conexión: pequeña pausa antes de reconectar
+                }
+                catch (Exception ex)
+                {
+                    if (!token.IsCancellationRequested && !isDisposing)
+                    {
+                        LogMensaje($"[STREAM] {ex.Message}. Reintentando...");
+                        token.WaitHandle.WaitOne(2000);
+                    }
+                }
+                finally
+                {
+                    registro.Dispose();
+                    response?.Close();
+                    request?.Abort();
+                }
+            }
+        }
+
+        // Extrae todos los JPEG completos del buffer, publica el último y devuelve los bytes que quedan pendientes.
+        private int ExtraerFrames(byte[] buffer, int readOffset)
+        {
+            while (true)
+            {
+                int start = FindBytes(buffer, 0, readOffset, SOI);
+                if (start < 0)
+                {
+                    // Sin inicio de JPEG: descartar todo salvo el último byte (podría ser el 0xFF de un marcador partido)
+                    if (readOffset > 1) { buffer[0] = buffer[readOffset - 1]; readOffset = 1; }
+                    break;
+                }
+
+                // El fin se busca DESPUÉS del inicio (antes podía tomar un 0xFFD9 de un fotograma anterior y atascarse)
+                int end = FindBytes(buffer, start + 2, readOffset, EOI);
+                if (end < 0)
+                {
+                    // Fotograma incompleto: descartar lo anterior al inicio y esperar más datos
+                    if (start > 0)
+                    {
+                        Buffer.BlockCopy(buffer, start, buffer, 0, readOffset - start);
+                        readOffset -= start;
+                    }
+                    break;
+                }
+
+                int length = (end + 2) - start;
+                byte[] jpeg = new byte[length];
+                Buffer.BlockCopy(buffer, start, jpeg, 0, length);
+                PublicarFrame(jpeg);
+
+                int remaining = readOffset - (end + 2);
+                if (remaining > 0) Buffer.BlockCopy(buffer, end + 2, buffer, 0, remaining);
+                readOffset = remaining;
+                if (remaining == 0) break;
+            }
+
+            if (readOffset >= buffer.Length - 4096) readOffset = 0; // seguridad ante datos corruptos
+            return readOffset;
+        }
+
+        private static int FindBytes(byte[] source, int from, int length, byte[] pattern)
+        {
+            for (int i = from; i <= length - pattern.Length; i++)
+            {
+                bool match = true;
+                for (int j = 0; j < pattern.Length; j++)
+                {
+                    if (source[i + j] != pattern[j]) { match = false; break; }
+                }
+                if (match) return i;
+            }
+            return -1;
+        }
+
+        private void PublicarFrame(byte[] jpeg)
+        {
+            lock (lockFrame) { ultimoJpeg = jpeg; } // sobrescribe: siempre se procesa el fotograma MÁS RECIENTE
+            ultimoFrameRecibido = DateTime.Now;
+            nuevoFrame.Set();
+        }
+
+        // ------------------------------------------------------------------
+        // PROCESAMIENTO (hilo independiente de la red)
+        // ------------------------------------------------------------------
+        private void BucleProcesamiento(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested && !isDisposing)
+            {
+                if (!nuevoFrame.WaitOne(500)) continue;
+
+                byte[] jpeg;
+                lock (lockFrame) { jpeg = ultimoJpeg; ultimoJpeg = null; }
+                if (jpeg == null) continue;
+
+                try
+                {
+                    using (Mat frame = new Mat())
+                    {
+                        CvInvoke.Imdecode(jpeg, ImreadModes.Color, frame);
+                        if (!frame.IsEmpty) ProcessFrame(frame);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[PROCESO] {ex.Message}");
+                }
+            }
+        }
+
+        private void ProcessFrame(Mat frame)
+        {
+            if (isDisposing || IsDisposed) return;
+
+            try
+            {
+                lock (lockObjetosNativos)
+                {
+                    if (detectorNet == null || recognizerNet == null || isDisposing) return;
+
+                    GestionarSolicitudes();
+
+                    float escala;
+                    using (Mat faces = DetectarRostros(frame, out escala))
+                    {
+                        float[] data;
+                        int idx = SeleccionarRostroPrincipal(faces, out data);
+
+                        if (idx >= 0 && escala != 1f)
+                        {
+                            // Los resultados vienen en coordenadas del frame reducido: se reescalan
+                            // al tamaño original antes de usarlos (recorte y dibujo siguen en alta resolución).
+                            int o = idx * faces.Cols;
+                            for (int k = 0; k < 14; k++) data[o + k] /= escala;
+                        }
+
+                        if (idx < 0)
+                        {
+                            if (registroActivo) MostrarEstado("Registro: no se detecta ningún rostro. Colócate frente a la cámara.");
+                            ResetearEstadoSiNoHayRostro();
+                        }
+                        else
+                        {
+                            ProcesarRostro(frame, data, faces.Cols, idx);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Error procesando fotograma: {ex.Message}");
+            }
+
+            MostrarFrame(frame);
+        }
+
+        // Corre YuNet sobre una copia reducida si el frame es grande; el frame original no se toca.
+        private Mat DetectarRostros(Mat frame, out float escala)
+        {
+            escala = 1f;
+            int ladoMax = Math.Max(frame.Width, frame.Height);
+            Mat entrada = frame;
+            bool copiaCreada = false;
+
+            if (ladoMax > ESCALA_MAX_DETECCION)
+            {
+                escala = (float)ESCALA_MAX_DETECCION / ladoMax;
+                entrada = new Mat();
+                CvInvoke.Resize(frame, entrada, Size.Empty, escala, escala, Inter.Linear);
+                copiaCreada = true;
+            }
+
+            if (ultimoTamanoDeteccion != entrada.Size)
+            {
+                ultimoTamanoDeteccion = entrada.Size;
+                detectorNet.InputSize = entrada.Size;
+            }
+
+            Mat faces = new Mat();
+            detectorNet.Detect(entrada, faces);
+
+            if (copiaCreada) entrada.Dispose();
+            return faces;
+        }
+
+        // Elige el rostro MÁS GRANDE (el más cercano a la cámara) entre los que superan el score mínimo
+        private int SeleccionarRostroPrincipal(Mat faces, out float[] data)
+        {
+            data = null;
+            if (faces.IsEmpty || faces.Rows == 0) return -1;
+
+            data = new float[faces.Rows * faces.Cols];
+            faces.CopyTo(data);
+
+            int mejor = -1;
+            float mayorArea = 0f;
+
+            for (int i = 0; i < faces.Rows; i++)
+            {
+                int o = i * faces.Cols;
+                if (data[o + 14] < SCORE_DETECCION) continue;
+
+                float area = data[o + 2] * data[o + 3];
+                if (area > mayorArea) { mayorArea = area; mejor = i; }
+            }
+            return mejor;
+        }
+
+        private void ProcesarRostro(Mat frame, float[] data, int cols, int i)
+        {
+            int o = i * cols;
+            ultimoRostroVisto = DateTime.Now;
+
+            float w = data[o + 2];
+            float h = data[o + 3];
+
+            Rectangle rect = new Rectangle((int)data[o], (int)data[o + 1], (int)w, (int)h);
+            rect = Rectangle.Intersect(rect, new Rectangle(0, 0, frame.Width, frame.Height));
+            if (rect.Width < 20 || rect.Height < 20) return;
+
+            // Rostro demasiado pequeño para reconocer con fiabilidad (sube la resolución de la cámara o acércate)
+            if (!registroActivo && (w < MIN_LADO_RECONOCER || h < MIN_LADO_RECONOCER))
+            {
+                DibujarRostro(frame, rect, "Muy lejos", COLOR_AMARILLO);
+                return;
+            }
+
+            // Fila de detección en coordenadas ya corregidas (data puede venir reescalado desde ProcessFrame)
+            float[] filaValores = new float[cols];
+            Array.Copy(data, o, filaValores, 0, cols);
+
+            using (Mat filaRostro = new Mat(1, cols, DepthType.Cv32F, 1))
+            using (Mat faceAligned = new Mat())
+            using (Mat feature = new Mat())
+            {
+                filaRostro.SetTo(filaValores);
+                recognizerNet.AlignCrop(frame, filaRostro, faceAligned);
+                recognizerNet.Feature(faceAligned, feature);
+
+                if (feature.IsEmpty) return;
+
+                // ---------- MODO REGISTRO ----------
+                if (registroActivo)
+                {
+                    AvanzarRegistro(frame.Size, data, o, faceAligned, feature);
+                    if (registroActivo)
+                        DibujarRostro(frame, rect, $"REGISTRANDO {muestrasRegistro.Count}/{MUESTRAS_REGISTRO}", COLOR_AZUL);
+                    return;
+                }
+
+                // ---------- MODO RECONOCIMIENTO ----------
+                double brillo = CalcularBrillo(faceAligned);
+                if (brillo < BRILLO_MIN || brillo > BRILLO_MAX)
+                {
+                    string motivoLuz = brillo < BRILLO_MIN ? "Contraluz / poca luz" : "Luz directa excesiva";
+                    DibujarRostro(frame, rect, motivoLuz, COLOR_AMARILLO);
+                    return; // no se arriesga una identificación con un vector degradado por la luz
+                }
+
+                if (CalcularAsimetriaIluminacion(faceAligned) > ASIMETRIA_MAX)
+                {
+                    DibujarRostro(frame, rect, "Contraluz lateral", COLOR_AMARILLO);
+                    return; // un lado de la cara quemado/en sombra igual degrada el vector, aunque el promedio general parezca normal
+                }
+
+                double mejorSim = 0.0, segundaSim = 0.0;
+                string mejorNombre = null;
+
+                foreach (PersonaRegistrada persona in listaPersonas)
+                {
+                    double sim = recognizerNet.Match(persona.Plantilla, feature, FaceRecognizerSF.DisType.Cosine);
+                    if (sim > mejorSim)
+                    {
+                        segundaSim = mejorSim;
+                        mejorSim = sim;
+                        mejorNombre = persona.Nombre;
+                    }
+                    else if (sim > segundaSim)
+                    {
+                        segundaSim = sim;
+                    }
+                }
+
+                bool margenSuficiente = (mejorSim - segundaSim) >= MARGEN_AMBIGUO;
+                string candidato;
+
+                if (mejorNombre != null && mejorSim >= UMBRAL_SFACE && margenSuficiente)
+                    candidato = mejorNombre;
+                else if (mejorNombre != null && mejorSim >= UMBRAL_SFACE && !margenSuficiente)
+                    candidato = ESTADO_AMBIGUO; // dos personas registradas dan una similitud muy parecida
+                else
+                    candidato = "Desconocido";
+
+                double simPromedio;
+                string identidad = ConfirmarIdentidad(candidato, mejorSim, out simPromedio);
+
+                bool analizando = (identidad == ESTADO_ANALIZANDO || identidad == ESTADO_AMBIGUO);
+                bool conocido = !analizando && identidad != "Desconocido";
+                MCvScalar color = analizando ? COLOR_AMARILLO : (conocido ? COLOR_VERDE : COLOR_ROJO);
+
+                DibujarRostro(frame, rect, $"{identidad} ({simPromedio:F2})", color);
+
+                if (!analizando)
+                {
+                    bool esDiferenteSujeto = (identidad != ultimoSujetoNotificado);
+                    bool cooldownExpirado = (DateTime.Now - ultimaNotificacion) > cooldownNotificacion;
+
+                    if (esDiferenteSujeto || cooldownExpirado)
+                    {
+                        ultimoSujetoNotificado = identidad;
+                        ultimaNotificacion = DateTime.Now;
+
+                        string sujetoCopy = identidad;
+                        double simCopy = simPromedio;
+                        EjecutarEnUI(() => ActualizarInterfazLectura(sujetoCopy, simCopy));
+
+                        // Marca presente en SQL fuera del lock: la latencia de red no debe frenar el video.
+                        if (sqlDisponible && conocido)
+                        {
+                            PersonaRegistrada persona = listaPersonas.FirstOrDefault(p => p.Nombre == identidad);
+                            if (persona?.IdBd != null)
+                            {
+                                int idParaSql = persona.IdBd.Value;
+                                Task.Run(() =>
+                                {
+                                    try
+                                    {
+                                        administradorSQL.MarcarPresente(idParaSql);
+                                        ActualizarGrilla();
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        System.Diagnostics.Debug.WriteLine($"[SQL] {ex.Message}");
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private void DibujarRostro(Mat frame, Rectangle rect, string texto, MCvScalar color)
+        {
+            CvInvoke.Rectangle(frame, rect, color, 2);
+            CvInvoke.PutText(frame, texto, new Point(rect.X, Math.Max(rect.Y - 10, 15)),
+                             FontFace.HersheySimplex, 0.6, color, 2);
+        }
+
+        // Votación sobre los últimos fotogramas: elimina el "parpadeo" de identidades por ruido del stream
+        private string ConfirmarIdentidad(string candidato, double similitud, out double simPromedio)
+        {
+            ultimosVotos.Enqueue(new KeyValuePair<string, double>(candidato, similitud));
+            while (ultimosVotos.Count > VENTANA_VOTOS) ultimosVotos.Dequeue();
+
+            var ganador = ultimosVotos.GroupBy(v => v.Key).OrderByDescending(g => g.Count()).First();
+            simPromedio = ganador.Average(v => v.Value);
+
+            if (ultimosVotos.Count < VOTOS_MINIMOS || ganador.Count() < VOTOS_MINIMOS)
+                return candidato == ESTADO_AMBIGUO ? ESTADO_AMBIGUO : ESTADO_ANALIZANDO;
+
+            return ganador.Key;
+        }
+
+        private void ResetearEstadoSiNoHayRostro()
+        {
+            if ((DateTime.Now - ultimoRostroVisto).TotalSeconds > 1.0)
+                ultimosVotos.Clear();
+
+            if ((DateTime.Now - ultimaNotificacion).TotalSeconds > 2)
+                ultimoSujetoNotificado = "";
+        }
+
+        // ------------------------------------------------------------------
+        // REGISTRO (varias muestras validadas -> una plantilla promedio)
+        // ------------------------------------------------------------------
+        private void GestionarSolicitudes()
+        {
+            if (solicitudBorrado)
+            {
+                solicitudBorrado = false;
+                CancelarRegistro(null);
+
+                if (sqlDisponible)
+                {
+                    try { administradorSQL.EliminarTodos(); }
+                    catch (Exception ex) { LogMensaje($"[ERROR] No se pudo borrar en SQL Server: {ex.Message}"); }
+                }
+
+                foreach (PersonaRegistrada p in listaPersonas) p.Dispose();
+                listaPersonas.Clear();
+                ultimosVotos.Clear();
+
+                EjecutarEnUI(() => textBox2.AppendText("[Registros borrados]" + Environment.NewLine));
+                MostrarEstado("Todos los registros fueron borrados.");
+                ActualizarGrilla();
+            }
+
+            if (solicitudRegistro)
+            {
+                solicitudRegistro = false;
+
+                if (listaPersonas.Count >= MAX_PERSONAS)
+                {
+                    MostrarEstado($"Límite alcanzado ({MAX_PERSONAS} personas). Usa 'Borrar todo' para liberar espacio.");
+                }
+                else if (!registroActivo)
+                {
+                    LiberarMuestrasRegistro();
+                    registroActivo = true;
+                    inicioRegistro = DateTime.Now;
+                    ultimaMuestra = DateTime.MinValue;
+                    MostrarEstado("Registro iniciado: mira de frente a la cámara y no te muevas.");
+                }
+            }
+
+            if (registroActivo && (DateTime.Now - inicioRegistro).TotalMilliseconds > MS_TIMEOUT_REGISTRO)
+            {
+                CancelarRegistro("Registro cancelado por tiempo. Presiona 'Registrar' para intentarlo de nuevo.");
+            }
+        }
+
+        private void AvanzarRegistro(Size frameSize, float[] data, int o, Mat faceAligned, Mat feature)
+        {
+            string motivo;
+            double nitidez;
+
+            if (!EsRostroValidoParaRegistro(frameSize, data, o, faceAligned, out motivo, out nitidez))
+            {
+                MostrarEstado("Registro: " + motivo);
+                return;
+            }
+
+            if ((DateTime.Now - ultimaMuestra).TotalMilliseconds < MS_ENTRE_MUESTRAS) return;
+
+            // Todas las muestras deben ser de la misma persona
+            if (muestrasRegistro.Count > 0)
+            {
+                double consistencia = recognizerNet.Match(muestrasRegistro[0], feature, FaceRecognizerSF.DisType.Cosine);
+                if (consistencia < UMBRAL_CONSISTENCIA)
+                {
+                    MostrarEstado("Registro: el rostro cambió. Debe haber una sola persona frente a la cámara.");
+                    return;
+                }
+            }
+
+            Mat copia = new Mat();
+            feature.CopyTo(copia);
+            muestrasRegistro.Add(copia);
+            ultimaMuestra = DateTime.Now;
+
+            LogMensaje($"[REGISTRO] Muestra {muestrasRegistro.Count}/{MUESTRAS_REGISTRO} (nitidez {nitidez:F0}, score {data[o + 14]:F2})");
+            MostrarEstado($"Registrando... {muestrasRegistro.Count}/{MUESTRAS_REGISTRO}");
+
+            if (muestrasRegistro.Count >= MUESTRAS_REGISTRO) FinalizarRegistro();
+        }
+
+        private bool EsRostroValidoParaRegistro(Size frameSize, float[] data, int o, Mat faceAligned,
+                                                out string motivo, out double nitidez)
+        {
+            motivo = "";
+            nitidez = 0;
+
+            float x = data[o];
+            float y = data[o + 1];
+            float w = data[o + 2];
+            float h = data[o + 3];
+            float score = data[o + 14];
+
+            if (score < SCORE_REGISTRO)
+            {
+                motivo = "Rostro poco claro. Mejora la iluminación y mira de frente.";
+                return false;
+            }
+
+            if (w < MIN_LADO_REGISTRO || h < MIN_LADO_REGISTRO)
+            {
+                motivo = "Acércate un poco a la cámara.";
+                return false;
+            }
+
+            if (x < MARGEN_BORDE || y < MARGEN_BORDE ||
+                x + w > frameSize.Width - MARGEN_BORDE || y + h > frameSize.Height - MARGEN_BORDE)
+            {
+                motivo = "Tu rostro toca el borde de la imagen. Aléjate un poco y céntrate.";
+                return false;
+            }
+
+            PointF ojoDerecho = new PointF(data[o + 4], data[o + 5]);
+            PointF ojoIzquierdo = new PointF(data[o + 6], data[o + 7]);
+            PointF nariz = new PointF(data[o + 8], data[o + 9]);
+
+            double deltaY = ojoIzquierdo.Y - ojoDerecho.Y;
+            double deltaX = ojoIzquierdo.X - ojoDerecho.X;
+            double anguloRoll = Math.Abs(Math.Atan2(deltaY, deltaX) * (180.0 / Math.PI));
+
+            if (anguloRoll > 12.0)
+            {
+                motivo = "Mantén la cabeza nivelada (sin ladearla).";
+                return false;
+            }
+
+            double distOjoDerNariz = Math.Abs(nariz.X - ojoDerecho.X);
+            double distOjoIzqNariz = Math.Abs(ojoIzquierdo.X - nariz.X);
+            double relacionYaw = distOjoDerNariz / (distOjoIzqNariz + 1e-5);
+
+            if (relacionYaw < 0.6 || relacionYaw > 1.67)
+            {
+                motivo = "Mira directamente de frente a la cámara.";
+                return false;
+            }
+
+            double brillo = CalcularBrillo(faceAligned);
+            if (brillo < BRILLO_MIN || brillo > BRILLO_MAX)
+            {
+                motivo = brillo < BRILLO_MIN
+                    ? "Demasiado oscuro / a contraluz. Ilumina tu rostro de frente."
+                    : "Demasiada luz directa sobre el rostro.";
+                return false;
+            }
+
+            double asimetria = CalcularAsimetriaIluminacion(faceAligned);
+            if (asimetria > ASIMETRIA_MAX)
+            {
+                motivo = "Contraluz lateral: un lado de tu cara está más iluminado que el otro. Ubicate de frente a la luz, no de costado.";
+                return false;
+            }
+
+            nitidez = CalcularNitidez(faceAligned);
+            if (nitidez < UMBRAL_NITIDEZ)
+            {
+                motivo = $"Imagen borrosa (nitidez {nitidez:F0}). Quédate quieto y mejora la luz.";
+                return false;
+            }
+
+            return true;
+        }
+
+        // Varianza del Laplaciano sobre el rostro alineado (112x112): mide el enfoque/movimiento
+        private double CalcularNitidez(Mat faceAligned)
+        {
+            using (Mat gris = new Mat())
+            using (Mat laplaciano = new Mat())
+            {
+                CvInvoke.CvtColor(faceAligned, gris, ColorConversion.Bgr2Gray);
+                CvInvoke.Laplacian(gris, laplaciano, DepthType.Cv64F);
+
+                MCvScalar media = new MCvScalar();
+                MCvScalar desviacion = new MCvScalar();
+                CvInvoke.MeanStdDev(laplaciano, ref media, ref desviacion);
+                return desviacion.V0 * desviacion.V0;
+            }
+        }
+
+        // Media de gris del rostro alineado: valores bajos = a contraluz/oscuro, altos = luz directa
+        private double CalcularBrillo(Mat faceAligned)
+        {
+            using (Mat gris = new Mat())
+            {
+                CvInvoke.CvtColor(faceAligned, gris, ColorConversion.Bgr2Gray);
+                return CvInvoke.Mean(gris).V0;
+            }
+        }
+
+        // Diferencia de brillo entre la mitad izquierda y derecha del rostro. CalcularBrillo() solo
+        // detecta cuando TODA la cara está muy oscura o muy clara en promedio; no detecta el caso típico
+        // de contraluz lateral (una ventana de un lado) donde el promedio general puede parecer normal
+        // pero un lado de la cara está quemado de luz y el otro en sombra, degradando igual el vector.
+        private double CalcularAsimetriaIluminacion(Mat faceAligned)
+        {
+            using (Mat gris = new Mat())
+            {
+                CvInvoke.CvtColor(faceAligned, gris, ColorConversion.Bgr2Gray);
+                int mitad = gris.Cols / 2;
+
+                using (Mat izquierda = new Mat(gris, new Rectangle(0, 0, mitad, gris.Rows)))
+                using (Mat derecha = new Mat(gris, new Rectangle(mitad, 0, gris.Cols - mitad, gris.Rows)))
+                {
+                    double brilloIzq = CvInvoke.Mean(izquierda).V0;
+                    double brilloDer = CvInvoke.Mean(derecha).V0;
+                    return Math.Abs(brilloIzq - brilloDer);
+                }
+            }
+        }
+
+        // Promedio normalizado de varias muestras: una sola plantilla por persona en vez de 5 vectores sueltos
+        private Mat CalcularCentroide(List<Mat> muestras)
+        {
+            int dim = muestras[0].Cols;
+            float[] suma = new float[dim];
+
+            foreach (Mat m in muestras)
+            {
+                float[] v = ValoresDeMat(m);
+                for (int k = 0; k < dim; k++) suma[k] += v[k];
+            }
+
+            float norma = 0f;
+            for (int k = 0; k < dim; k++)
+            {
+                suma[k] /= muestras.Count;
+                norma += suma[k] * suma[k];
+            }
+            norma = (float)Math.Sqrt(norma);
+            if (norma > 1e-6f)
+                for (int k = 0; k < dim; k++) suma[k] /= norma;
+
+            Mat centroide = new Mat(1, dim, DepthType.Cv32F, 1);
+            centroide.SetTo(suma);
+            return centroide;
+        }
+
+        private void FinalizarRegistro()
+        {
+            // Evitar duplicados: si el rostro ya coincide con alguien registrado, no se crea otra persona
+            PersonaRegistrada duplicada = null;
+            foreach (PersonaRegistrada p in listaPersonas)
+            {
+                foreach (Mat muestra in muestrasRegistro)
+                {
+                    double sim = recognizerNet.Match(p.Plantilla, muestra, FaceRecognizerSF.DisType.Cosine);
+                    if (sim >= UMBRAL_SFACE) { duplicada = p; break; }
+                }
+                if (duplicada != null) break;
+            }
+
+            if (duplicada != null)
+            {
+                CancelarRegistro($"Este rostro ya está registrado como {duplicada.Nombre}. No se creó un duplicado.");
+                return;
+            }
+
+            Mat centroide = CalcularCentroide(muestrasRegistro);
+            PersonaRegistrada nueva = new PersonaRegistrada { Plantilla = centroide };
+
+            // BUG CORREGIDO: antes el nombre salía de "listaPersonas.Count + 1". Ese número depende de
+            // cuánta gente hay CARGADA EN MEMORIA en este momento, no de cuánta gente se registró alguna
+            // vez. Si borrabas a alguien (el conteo bajaba) y registrabas a otra persona, el nombre se
+            // repetía (por eso viste dos "Sujeto 2"). Ahora el nombre sale del Id real de SQL Server
+            // (IDENTITY), que NUNCA se repite ni se reutiliza aunque borres filas — cada persona nueva
+            // recibe un Id más alto que cualquiera que haya existido antes, para siempre.
+            if (sqlDisponible)
+            {
+                try
+                {
+                    byte[] plantillaBytes = VectorABytes(ValoresDeMat(centroide));
+                    // Inserta con un nombre provisorio y en la misma operación lo renombra a "Sujeto {Id real}"
+                    nueva.IdBd = administradorSQL.InsertarSujetoAutomatico(plantillaBytes);
+                    nueva.Id = nueva.IdBd.Value;
+                    nueva.Nombre = $"Sujeto {nueva.IdBd.Value}";
+                }
+                catch (Exception ex)
+                {
+                    LogMensaje($"[AVISO] No se pudo guardar en SQL Server: {ex.Message}");
+                }
+            }
+
+            if (nueva.Nombre == null)
+            {
+                // Sin SQL: contador local que solo avanza (ver comentario en su declaración)
+                proximoIdLocalFallback++;
+                nueva.Id = proximoIdLocalFallback;
+                nueva.Nombre = $"Sujeto {proximoIdLocalFallback}";
+            }
+
+            listaPersonas.Add(nueva);
+            LiberarMuestrasRegistro(); // las muestras crudas ya no hacen falta: quedó la plantilla
+            registroActivo = false;
+            ultimosVotos.Clear();
+            ActualizarGrilla();
+
+            string nombre = nueva.Nombre;
+            int total = listaPersonas.Count;
+            string horaLocal = DateTime.Now.ToString("HH:mm:ss");
+
+            EjecutarEnUI(() =>
+            {
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine($"[{horaLocal}] ¡CAPTURA EXITOSA!");
+                sb.AppendLine($"  • Registrado como: {nombre}");
+                sb.AppendLine($"  • Muestras usadas para la plantilla: {MUESTRAS_REGISTRO}");
+                sb.AppendLine($"  • Estado: Guardado en memoria ({total}/{MAX_PERSONAS})");
+                sb.AppendLine("--------------------------------------------------");
+                textBox2.AppendText(sb.ToString());
+                textBox1.Text = $"[{horaLocal}] REGISTRADO: {nombre}";
+            });
+        }
+
+        private void CancelarRegistro(string motivo)
+        {
+            LiberarMuestrasRegistro();
+            registroActivo = false;
+            if (motivo != null) MostrarEstado(motivo);
+        }
+
+        private void LiberarMuestrasRegistro()
+        {
+            foreach (Mat m in muestrasRegistro) m.Dispose();
+            muestrasRegistro.Clear();
+        }
+
+        // ------------------------------------------------------------------
+        // INTERFAZ
+        // ------------------------------------------------------------------
+        private void ActualizarInterfazLectura(string sujeto, double similitud)
+        {
+            if (isDisposing || IsDisposed) return;
+
+            string horaLocal = DateTime.Now.ToString("HH:mm:ss");
+
+            if (sujeto != "Desconocido")
+                textBox1.Text = $"[{horaLocal}] ACCESO CONCEDIDO: {sujeto} (Similitud: {similitud:F2})";
+            else
+                textBox1.Text = $"[{horaLocal}] ACCESO DENEGADO: DESCONOCIDO (Similitud: {similitud:F2})";
+        }
+
+        // Muestra el fotograma sin acumular bitmaps si la interfaz va más lenta que el procesamiento
+        private void MostrarFrame(Mat frame)
+        {
+            if (pictureBox1 == null || IsDisposed || isDisposing) return;
+            if (Interlocked.Exchange(ref frameUIPendiente, 1) == 1) return; // la UI sigue ocupada: descartar este
+
+            Bitmap frameBitmap = null;
+            try
+            {
+                frameBitmap = frame.ToBitmap();
+                Bitmap bmp = frameBitmap;
+
+                BeginInvoke(new Action(() =>
+                {
+                    try
+                    {
+                        if (isDisposing || IsDisposed) { bmp.Dispose(); return; }
+
+                        Image anterior = pictureBox1.Image;
+                        pictureBox1.Image = bmp;
+                        anterior?.Dispose();
+                    }
+                    finally
+                    {
+                        Interlocked.Exchange(ref frameUIPendiente, 0);
+                    }
+                }));
+            }
+            catch (Exception)
+            {
+                frameBitmap?.Dispose();
+                Interlocked.Exchange(ref frameUIPendiente, 0);
+            }
+        }
+
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            isDisposing = true;
+            cancellationTokenSource?.Cancel();
+            timerEstadoConexion?.Stop();
+
+            // Si el hilo de procesamiento está a mitad de un fotograma, este lock espera a que termine
+            lock (lockObjetosNativos)
+            {
+                detectorNet?.Dispose();
+                detectorNet = null;
+
+                recognizerNet?.Dispose();
+                recognizerNet = null;
+
+                LiberarMuestrasRegistro();
+                foreach (PersonaRegistrada p in listaPersonas) p.Dispose();
+                listaPersonas.Clear();
+            }
+        }
+    }
+
+    public class PersonaRegistrada : IDisposable
+    {
+        public int Id { get; set; }
+        public int? IdBd { get; set; }       // Id real en SQL Server (null si todavía no se guardó)
+        public string Nombre { get; set; }
+
+        // Vector 128D promedio y normalizado de las muestras validadas al registrar
+        public Mat Plantilla { get; set; }
+
+        public void Dispose()
+        {
+            Plantilla?.Dispose();
+            Plantilla = null;
+        }
+    }
+}
