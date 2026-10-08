@@ -47,7 +47,12 @@ namespace Proyecto_ReconocimientoFacial_0._1
         private const int MIN_LADO_RECONOCER = 50;        // Lado mínimo (px, resolución original) para reconocer
         private const int MIN_LADO_REGISTRO = 70;         // Lado mínimo (px, resolución original) para registrar
         private const int MARGEN_BORDE = 4;               // Margen (px) al borde: rostro cortado = alineación mala
-        private const double UMBRAL_NITIDEZ = 40.0;       // Varianza del Laplaciano (ajústala con los valores del log)
+        private const double UMBRAL_NITIDEZ = 40.0;           // Varianza del Laplaciano al REGISTRAR (ajustá con los valores del log)
+        private const double UMBRAL_NITIDEZ_RECONOCER = 40.0; // Idem, pero al RECONOCER en vivo. Separado por si querés
+                                                              // relajarlo un poco en video (es más exigente estar siempre
+                                                              // igual de nítido en movimiento que en una foto de registro quieta).
+        private const double UMBRAL_YAW_MIN = 0.6;            // Relación ojo-nariz mínima: por debajo, está de perfil
+        private const double UMBRAL_YAW_MAX = 1.67;           // Relación ojo-nariz máxima: por encima, está de perfil (al otro lado)
         private const double BRILLO_MIN = 50.0;           // Media de gris (0-255) mínima: por debajo, a contraluz
         private const double BRILLO_MAX = 210.0;          // Media de gris (0-255) máxima: por encima, luz directa
         private const double ASIMETRIA_MAX = 45.0;        // Diferencia de brillo izq/der máxima: por encima, contraluz lateral
@@ -64,7 +69,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
         // Cámara ESP32 - debe coincidir EXACTO con la IP fija que pusiste en el .ino (local_IP).
         // Si volvés a cambiar la IP fija en el firmware, actualizala también acá.
-        private readonly string ipCamara = "192.168.1.110";
+        private readonly string ipCamara = "192.168.1.105";
         private readonly string streamUrl;
         private readonly string tempUrl;
         private readonly TimeSpan intervaloTemp = TimeSpan.FromSeconds(20);
@@ -947,18 +952,15 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 }
 
                 // ---------- MODO RECONOCIMIENTO ----------
-                double brillo = CalcularBrillo(faceAligned);
-                if (brillo < BRILLO_MIN || brillo > BRILLO_MAX)
+                // Misma validación que al registrar (pose de frente, nitidez, luz), pero con los
+                // umbrales más permisivos de "paraRegistro: false". Si la cara está de perfil, lejos,
+                // borrosa o mal iluminada, se descarta ACÁ, antes de intentar comparar contra nadie.
+                string motivoRechazo;
+                double nitidezReconocimiento;
+                if (!EsRostroValido(frame.Size, data, o, faceAligned, paraRegistro: false, out motivoRechazo, out nitidezReconocimiento))
                 {
-                    string motivoLuz = brillo < BRILLO_MIN ? "Contraluz / poca luz" : "Luz directa excesiva";
-                    DibujarRostro(frame, rect, motivoLuz, COLOR_AMARILLO);
-                    return; // no se arriesga una identificación con un vector degradado por la luz
-                }
-
-                if (CalcularAsimetriaIluminacion(faceAligned) > ASIMETRIA_MAX)
-                {
-                    DibujarRostro(frame, rect, "Contraluz lateral", COLOR_AMARILLO);
-                    return; // un lado de la cara quemado/en sombra igual degrada el vector, aunque el promedio general parezca normal
+                    DibujarRostro(frame, rect, motivoRechazo, COLOR_AMARILLO);
+                    return; // no se arriesga una identificación con un rostro que no cumple el estándar mínimo
                 }
 
                 double mejorSim = 0.0, segundaSim = 0.0;
@@ -1123,7 +1125,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             string motivo;
             double nitidez;
 
-            if (!EsRostroValidoParaRegistro(frameSize, data, o, faceAligned, out motivo, out nitidez))
+            if (!EsRostroValido(frameSize, data, o, faceAligned, paraRegistro: true, out motivo, out nitidez))
             {
                 MostrarEstado("Registro: " + motivo);
                 return;
@@ -1153,8 +1155,14 @@ namespace Proyecto_ReconocimientoFacial_0._1
             if (muestrasRegistro.Count >= MUESTRAS_REGISTRO) FinalizarRegistro();
         }
 
-        private bool EsRostroValidoParaRegistro(Size frameSize, float[] data, int o, Mat faceAligned,
-                                                out string motivo, out double nitidez)
+        // BUG CORREGIDO: esta validación (pose de frente, nitidez, luz) antes SOLO se llamaba al
+        // registrar (AvanzarRegistro). El reconocimiento en vivo nunca la usaba — por eso una cara
+        // de perfil, lejos o borrosa igual se intentaba reconocer, usando solo tamaño/brillo/asimetría.
+        // Ahora la misma función sirve para los dos modos: "paraRegistro" decide qué tan exigentes son
+        // el score mínimo, el tamaño mínimo y la nitidez mínima (el registro siempre es más estricto
+        // que el reconocimiento, porque de ahí sale la plantilla que se usa para comparar todo después).
+        private bool EsRostroValido(Size frameSize, float[] data, int o, Mat faceAligned, bool paraRegistro,
+                                    out string motivo, out double nitidez)
         {
             motivo = "";
             nitidez = 0;
@@ -1165,13 +1173,16 @@ namespace Proyecto_ReconocimientoFacial_0._1
             float h = data[o + 3];
             float score = data[o + 14];
 
-            if (score < SCORE_REGISTRO)
+            float scoreMinimo = paraRegistro ? SCORE_REGISTRO : SCORE_DETECCION;
+            int ladoMinimo = paraRegistro ? MIN_LADO_REGISTRO : MIN_LADO_RECONOCER;
+
+            if (score < scoreMinimo)
             {
                 motivo = "Rostro poco claro. Mejora la iluminación y mira de frente.";
                 return false;
             }
 
-            if (w < MIN_LADO_REGISTRO || h < MIN_LADO_REGISTRO)
+            if (w < ladoMinimo || h < ladoMinimo)
             {
                 motivo = "Acércate un poco a la cámara.";
                 return false;
@@ -1198,13 +1209,17 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 return false;
             }
 
+            // Esta es la relación que detecta PERFIL: con la cara de frente, la nariz queda a mitad
+            // de camino entre los dos ojos (relación cercana a 1.0). Girando la cabeza hacia un
+            // costado, la nariz se acerca a uno de los ojos y se aleja del otro, y la relación se
+            // dispara para arriba o para abajo. Fuera de [0.6, 1.67] ya se considera perfil, no frente.
             double distOjoDerNariz = Math.Abs(nariz.X - ojoDerecho.X);
             double distOjoIzqNariz = Math.Abs(ojoIzquierdo.X - nariz.X);
             double relacionYaw = distOjoDerNariz / (distOjoIzqNariz + 1e-5);
 
-            if (relacionYaw < 0.6 || relacionYaw > 1.67)
+            if (relacionYaw < UMBRAL_YAW_MIN || relacionYaw > UMBRAL_YAW_MAX)
             {
-                motivo = "Mira directamente de frente a la cámara.";
+                motivo = "Mira directamente de frente a la cámara (de perfil no se reconoce).";
                 return false;
             }
 
@@ -1225,9 +1240,10 @@ namespace Proyecto_ReconocimientoFacial_0._1
             }
 
             nitidez = CalcularNitidez(faceAligned);
-            if (nitidez < UMBRAL_NITIDEZ)
+            double umbralNitidezAplicado = paraRegistro ? UMBRAL_NITIDEZ : UMBRAL_NITIDEZ_RECONOCER;
+            if (nitidez < umbralNitidezAplicado)
             {
-                motivo = $"Imagen borrosa (nitidez {nitidez:F0}). Quédate quieto y mejora la luz.";
+                motivo = $"Imagen borrosa (nitidez {nitidez:F0}). Acercate y quedate quieto.";
                 return false;
             }
 
