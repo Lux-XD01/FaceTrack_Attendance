@@ -264,7 +264,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             if (formCargado) return;
             formCargado = true;
 
-            textBox1.Text = "ESPERANDO DETECCIÓN..." + Environment.NewLine;
+            ActualizarMetricas(null, null, null); // deja textBox1 con el panel de métricas en "--"
             textBox2.Text = "=== DATOS BIOMÉTRICOS ===" + Environment.NewLine;
             LogMensaje("=== LOGS DE CONEXIÓN ESP32 ===");
             LogMensaje("Usá el botón 'Registrar' para capturar un rostro y 'Borrar todo' para reiniciar la lista.");
@@ -771,8 +771,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             ultimoEstado = mensaje;
             ultimoEstadoTs = ahora;
 
-            string texto = $"[{ahora:HH:mm:ss}] {mensaje}";
-            EjecutarEnUI(() => { textBox1.Text = texto; });
+        // LogMensaje(mensaje); // LogMensaje ya agrega la hora
         }
 
         // ------------------------------------------------------------------
@@ -1341,7 +1340,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 $"CONFIDENCIA (YuNet):  {sConfianza}" + Environment.NewLine +
                 $"SIMILITUD (Fija: >{UMBRAL_SFACE:F2}):  {sSimilitud}";
 
-            EjecutarEnUI(() => lblMetricas.Text = texto);
+            EjecutarEnUI(() => textBox1.Text = texto);
         }
         // Elige qué mensaje va al pie. Prioridad: 1) mensaje temporal (ej. "Usted ha sido registrado"),
         // 2) indicación de posicionamiento ya filtrada (sin parpadeo), 3) estado normal (presente, etc.).
@@ -1788,7 +1787,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 sb.AppendLine($"  • Estado: Guardado en memoria ({total}/{MAX_PERSONAS})");
                 sb.AppendLine("--------------------------------------------------");
                 textBox2.AppendText(sb.ToString());
-                textBox1.Text = $"[{horaLocal}] REGISTRADO: {nombre}";
+                
             });
         }
 
@@ -1815,9 +1814,10 @@ namespace Proyecto_ReconocimientoFacial_0._1
             string horaLocal = DateTime.Now.ToString("HH:mm:ss");
 
             if (sujeto != "Desconocido")
-                textBox1.Text = $"[{horaLocal}] ACCESO CONCEDIDO: {sujeto} (Similitud: {similitud:F2})";
+                textBox2.AppendText($"[{horaLocal}] ACCESO CONCEDIDO: {sujeto} (Similitud: {similitud:F2}){Environment.NewLine}");
             else
-                textBox1.Text = $"[{horaLocal}] ACCESO DENEGADO: DESCONOCIDO (Similitud: {similitud:F2})";
+                textBox2.AppendText($"[{horaLocal}] ACCESO DENEGADO: DESCONOCIDO (Similitud: {similitud:F2}){Environment.NewLine}");
+        
         }
 
         // Muestra el fotograma sin acumular bitmaps si la interfaz va más lenta que el procesamiento
@@ -1875,11 +1875,6 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 foreach (PersonaRegistrada p in listaPersonas) p.Dispose();
                 listaPersonas.Clear();
             }
-        }
-
-        private void label1_Click(object sender, EventArgs e)
-        {
-
         }
     }
 

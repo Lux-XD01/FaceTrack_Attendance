@@ -43,7 +43,6 @@
             this.lblIndicadorConexion = new System.Windows.Forms.Label();
             this.lblEstadoConexion = new System.Windows.Forms.Label();
             this.panelTemperatura = new System.Windows.Forms.Panel();
-            this.lblMetricas = new System.Windows.Forms.Label();
             ((System.ComponentModel.ISupportInitialize)(this.pictureBox1)).BeginInit();
             ((System.ComponentModel.ISupportInitialize)(this.dgvAlumnos)).BeginInit();
             this.SuspendLayout();
@@ -64,12 +63,12 @@
             this.textBox1.Name = "textBox1";
             this.textBox1.ReadOnly = true;
             this.textBox1.ScrollBars = System.Windows.Forms.ScrollBars.Both;
-            this.textBox1.Size = new System.Drawing.Size(715, 55);
+            this.textBox1.Size = new System.Drawing.Size(715, 127);
             this.textBox1.TabIndex = 1;
             // 
             // textBox2
             // 
-            this.textBox2.Location = new System.Drawing.Point(12, 481);
+            this.textBox2.Location = new System.Drawing.Point(12, 553);
             this.textBox2.Multiline = true;
             this.textBox2.Name = "textBox2";
             this.textBox2.ReadOnly = true;
@@ -79,7 +78,7 @@
             // 
             // textBox3
             // 
-            this.textBox3.Location = new System.Drawing.Point(372, 481);
+            this.textBox3.Location = new System.Drawing.Point(372, 553);
             this.textBox3.Multiline = true;
             this.textBox3.Name = "textBox3";
             this.textBox3.ReadOnly = true;
@@ -175,7 +174,7 @@
             // lblIP
             // 
             this.lblIP.AutoSize = true;
-            this.lblIP.Location = new System.Drawing.Point(74, 672);
+            this.lblIP.Location = new System.Drawing.Point(73, 772);
             this.lblIP.Name = "lblIP";
             this.lblIP.Size = new System.Drawing.Size(44, 16);
             this.lblIP.TabIndex = 12;
@@ -184,7 +183,7 @@
             // lblIndicadorConexion
             // 
             this.lblIndicadorConexion.AutoSize = true;
-            this.lblIndicadorConexion.Location = new System.Drawing.Point(226, 672);
+            this.lblIndicadorConexion.Location = new System.Drawing.Point(225, 772);
             this.lblIndicadorConexion.Name = "lblIndicadorConexion";
             this.lblIndicadorConexion.Size = new System.Drawing.Size(44, 16);
             this.lblIndicadorConexion.TabIndex = 13;
@@ -193,7 +192,7 @@
             // lblEstadoConexion
             // 
             this.lblEstadoConexion.AutoSize = true;
-            this.lblEstadoConexion.Location = new System.Drawing.Point(411, 672);
+            this.lblEstadoConexion.Location = new System.Drawing.Point(410, 772);
             this.lblEstadoConexion.Name = "lblEstadoConexion";
             this.lblEstadoConexion.Size = new System.Drawing.Size(44, 16);
             this.lblEstadoConexion.TabIndex = 14;
@@ -207,22 +206,11 @@
             this.panelTemperatura.TabIndex = 0;
             this.panelTemperatura.Paint += new System.Windows.Forms.PaintEventHandler(this.panelTemperatura_Paint);
             // 
-            // lblMetricas
-            // 
-            this.lblMetricas.AutoSize = true;
-            this.lblMetricas.Location = new System.Drawing.Point(590, 672);
-            this.lblMetricas.Name = "lblMetricas";
-            this.lblMetricas.Size = new System.Drawing.Size(44, 16);
-            this.lblMetricas.TabIndex = 15;
-            this.lblMetricas.Text = "label4";
-            this.lblMetricas.Click += new System.EventHandler(this.label1_Click);
-            // 
             // Form1
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(8F, 16F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
             this.ClientSize = new System.Drawing.Size(1633, 875);
-            this.Controls.Add(this.lblMetricas);
             this.Controls.Add(this.panelTemperatura);
             this.Controls.Add(this.lblEstadoConexion);
             this.Controls.Add(this.lblIndicadorConexion);
@@ -265,7 +253,6 @@
         private System.Windows.Forms.Label lblIndicadorConexion;
         private System.Windows.Forms.Label lblEstadoConexion;
         private System.Windows.Forms.Panel panelTemperatura;
-        private System.Windows.Forms.Label lblMetricas;
     }
 }
 
