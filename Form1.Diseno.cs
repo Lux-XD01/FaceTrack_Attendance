@@ -95,17 +95,18 @@ namespace Proyecto_ReconocimientoFacial_0._1
             grilla.RowStyles.Add(new RowStyle(SizeType.Absolute, 38f));
             grilla.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
-            // En el diseñador txtBuscar era Multiline (55 px de alto). Una caja de búsqueda debe ser de una línea.
+            // Configuración del TextBox interno
             txtBuscar.Multiline = false;
             txtBuscar.ScrollBars = ScrollBars.None;
-            txtBuscar.Anchor = AnchorStyles.Left | AnchorStyles.Right; // sin Top/Bottom: se centra vertical
-            txtBuscar.Margin = new Padding(0, 0, 0, 2);
+
+            // Envolvemos el txtBuscar dentro del nuevo PanelBusquedaRedondeado
+            PanelBusquedaRedondeado buscadorRedondeado = new PanelBusquedaRedondeado(txtBuscar);
 
             dgvAlumnos.Dock = DockStyle.Fill;
             dgvAlumnos.Margin = Padding.Empty;
             dgvAlumnos.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
 
-            grilla.Controls.Add(txtBuscar, 0, 0);
+            grilla.Controls.Add(buscadorRedondeado, 0, 0);
             grilla.Controls.Add(dgvAlumnos, 0, 1);
             panelGrilla.Controls.Add(grilla);
 
@@ -124,9 +125,9 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
             TabControlOscuro tabs = new TabControlOscuro();
             tabs.Name = "tabPrincipal";
-            tabs.TabPages.Add(CrearPagina("LOGS BIOMÉTRICOS (SFace)", textBox2, true));
-            tabs.TabPages.Add(CrearPagina("LOGS DE CONEXIÓN", textBox3, true));
-            tabs.TabPages.Add(CrearPagina("MÉTRICAS EN VIVO", textBox1, false));
+            tabs.TabPages.Add(CrearPagina("LOGS (SFace)", textBox2, true));
+            tabs.TabPages.Add(CrearPagina("LOGS CONEXIÓN", textBox3, true));
+            tabs.TabPages.Add(CrearPagina("MÉTRICAS VIVO", textBox1, false));
             tabs.SelectedIndex = 2; // arranca mostrando las métricas
             panelLogs.Controls.Add(tabs);
             inferior.Controls.Add(panelLogs, 0, 0);

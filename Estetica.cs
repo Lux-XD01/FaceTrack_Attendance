@@ -6,23 +6,23 @@ using System.Drawing.Text;
 using System.Linq;
 using System.Windows.Forms;
 
+
 namespace Proyecto_ReconocimientoFacial_0._1
 {
     public static class Estetica
     {
-        // ---- Paleta de colores (Dark Synthwave / Cyberpunk Soft) ----
-        public static readonly Color ColorFondo = Color.FromArgb(32, 18, 48);          // Púrpura oscuro profundo
-        public static readonly Color ColorPanel = Color.FromArgb(52, 28, 72);          // Púrpura medio para contenedores
-        public static readonly Color ColorPrimario = Color.FromArgb(88, 42, 114);      // Púrpura vivo
-        public static readonly Color ColorAcento = Color.FromArgb(240, 140, 110);      // Coral / Salmón
-        public static readonly Color ColorBotonSecundario = Color.FromArgb(120, 80, 150); // Violeta suave
-        public static readonly Color ColorTextoClaro = Color.FromArgb(250, 235, 220);   // Crema claro
-        public static readonly Color ColorPeligro = Color.FromArgb(210, 70, 70);       // Rojo coral
-        public static readonly Color ColorExito = Color.FromArgb(60, 190, 110);        // Verde brillante
-        public static readonly Color ColorConsolaFondo = Color.FromArgb(22, 12, 34);   // Púrpura casi negro
-        public static readonly Color ColorConsolaTexto = Color.FromArgb(255, 180, 140); // Crema/Naranja consola
-        public static readonly Color ColorBorde = Color.FromArgb(120, 70, 150);        // Borde de paneles y pestañas
-
+        // ---- Paleta de colores ajustada (Fucsia Oscuro / Synthwave) ----
+        public static readonly Color ColorFondo = Color.FromArgb(28, 12, 38);            // Púrpura muy oscuro
+        public static readonly Color ColorPanel = Color.FromArgb(48, 20, 58);            // Púrpura fucsia contenedor
+        public static readonly Color ColorPrimario = Color.FromArgb(95, 30, 95);        // Fucsia medio
+        public static readonly Color ColorAcento = Color.FromArgb(240, 130, 110);        // Salmón brillante
+        public static readonly Color ColorBotonSecundario = Color.FromArgb(110, 60, 130); // Violeta / Fucsia suave
+        public static readonly Color ColorTextoClaro = Color.FromArgb(245, 230, 245);     // Blanco rosado
+        public static readonly Color ColorPeligro = Color.FromArgb(215, 60, 75);         // Rojo coral
+        public static readonly Color ColorExito = Color.FromArgb(60, 190, 110);          // Verde brillante
+        public static readonly Color ColorConsolaFondo = Color.FromArgb(20, 8, 28);      // Púrpura casi negro
+        public static readonly Color ColorConsolaTexto = Color.FromArgb(255, 180, 140);   // Naranja suave
+        public static readonly Color ColorBorde = Color.FromArgb(135, 45, 120);          // Borde Fucsia brillante
         // ------------------------------------------------------------------
         // ESTILO GENERAL (se aplica recorriendo TODOS los controles, también los anidados)
         // ------------------------------------------------------------------
@@ -172,7 +172,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
         // GRÁFICO DE TEMPERATURA (sin cambios respecto a tu versión)
         // ------------------------------------------------------------------
         public static void DibujarGraficoTemperatura(Graphics g, Rectangle area,
-                                                      IReadOnlyList<(DateTime Hora, double Temp)> datos)
+                                              IReadOnlyList<(DateTime Hora, double Temp)> datos)
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.Clear(ColorConsolaFondo);
@@ -236,6 +236,30 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 puntos[i] = new PointF(x, y);
             }
 
+            // --------------------------------------------------------------
+            // BLOQUE AGREGADO: SOMBRA DEGRADADA (TRANSPARENTE DE ARRIBA HACIA ABAJO)
+            // --------------------------------------------------------------
+            using (GraphicsPath rutaSombra = new GraphicsPath())
+            {
+                rutaSombra.AddLines(puntos);
+                rutaSombra.AddLine(puntos[puntos.Length - 1], new PointF(puntos[puntos.Length - 1].X, grafico.Bottom));
+                rutaSombra.AddLine(new PointF(puntos[puntos.Length - 1].X, grafico.Bottom), new PointF(puntos[0].X, grafico.Bottom));
+                rutaSombra.CloseFigure();
+
+                Color colorArriba = Color.FromArgb(80, ColorAcento);
+                Color colorAbajo = Color.FromArgb(0, ColorConsolaFondo);
+
+                using (LinearGradientBrush pincelDegradado = new LinearGradientBrush(
+                    new PointF(0, grafico.Top),
+                    new PointF(0, grafico.Bottom),
+                    colorArriba,
+                    colorAbajo))
+                {
+                    g.FillPath(pincelDegradado, rutaSombra);
+                }
+            }
+
+            // LÍNEA PRINCIPAL (SE MANTIENE IGUAL)
             using (Pen lineaPen = new Pen(ColorAcento, 2.5f))
                 g.DrawLines(lineaPen, puntos);
 
@@ -251,6 +275,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 g.DrawString(texto, fActual, bActual, grafico.Right - tam.Width, area.Top - 2);
             }
         }
+
     }
 
     // ----------------------------------------------------------------------
@@ -348,8 +373,9 @@ namespace Proyecto_ReconocimientoFacial_0._1
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
 
             Dock = DockStyle.Fill;
-            Font = new Font("Segoe UI", 8.5f, FontStyle.Bold); // se usa también para medir las pestañas
-            Padding = new Point(10, 5);
+            Font = new Font("Segoe UI", 7.5f, FontStyle.Bold); // Tamaño reducido para que quepan juntas
+            SizeMode = TabSizeMode.Fixed;
+            ItemSize = new Size(110, 26); // Ancho y alto fijo por pestaña
         }
 
         protected override void OnSelectedIndexChanged(EventArgs e)
@@ -365,9 +391,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
             g.Clear(Estetica.ColorPanel);
 
-            // Borde alrededor del área de contenido de las páginas
             Rectangle pagina = DisplayRectangle;
-            pagina.Inflate(2, 2);
+            pagina.Inflate(1, 1);
             using (Pen borde = new Pen(Estetica.ColorBorde))
                 g.DrawRectangle(borde, pagina);
 
@@ -387,14 +412,101 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
                     if (seleccionada)
                     {
-                        using (Pen acento = new Pen(Estetica.ColorAcento, 2f))
-                            g.DrawLine(acento, r.Left, r.Top + 1, r.Right, r.Top + 1);
+                        using (Pen acento = new Pen(Estetica.ColorAcento, 2.5f))
+                            g.DrawLine(acento, r.Left, r.Bottom - 1, r.Right, r.Bottom - 1);
                     }
 
                     using (Brush texto = new SolidBrush(seleccionada ? Estetica.ColorAcento : Estetica.ColorTextoClaro))
                         g.DrawString(TabPages[i].Text, Font, texto, r, formato);
                 }
             }
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // BARRA DE BÚSQUEDA REDONDEADA CON LUPA
+    // ----------------------------------------------------------------------
+    public class PanelBusquedaRedondeado : Panel
+    {
+        private readonly TextBox txtInterno;
+        private const string PLACEHOLDER = "Buscar...";
+
+        public TextBox TextBox => txtInterno;
+
+        public PanelBusquedaRedondeado(TextBox textBoxExistente)
+        {
+            txtInterno = textBoxExistente;
+            txtInterno.BorderStyle = BorderStyle.None;
+            txtInterno.BackColor = Color.FromArgb(20, 8, 28);
+            txtInterno.ForeColor = Color.Gray;
+            txtInterno.Text = PLACEHOLDER;
+            txtInterno.Font = new Font("Segoe UI", 9.5f);
+
+            txtInterno.GotFocus += (s, e) => {
+                if (txtInterno.Text == PLACEHOLDER)
+                {
+                    txtInterno.Text = "";
+                    txtInterno.ForeColor = Estetica.ColorTextoClaro;
+                }
+            };
+
+            txtInterno.LostFocus += (s, e) => {
+                if (string.IsNullOrWhiteSpace(txtInterno.Text))
+                {
+                    txtInterno.Text = PLACEHOLDER;
+                    txtInterno.ForeColor = Color.Gray;
+                }
+            };
+
+            this.Controls.Add(txtInterno);
+            this.Padding = new Padding(32, 6, 12, 6);
+            this.Height = 34;
+            this.Dock = DockStyle.Fill;
+            this.DoubleBuffered = true;
+        }
+
+        protected override void OnLayout(LayoutEventArgs levent)
+        {
+            base.OnLayout(levent);
+            if (txtInterno != null)
+            {
+                txtInterno.Location = new Point(32, (this.Height - txtInterno.Height) / 2);
+                txtInterno.Width = Math.Max(10, this.Width - 44);
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            Rectangle r = new Rectangle(1, 1, Width - 3, Height - 3);
+            if (r.Width <= 0 || r.Height <= 0) return;
+
+            using (GraphicsPath path = RutaCapsula(r))
+            using (Brush fondo = new SolidBrush(Color.FromArgb(20, 8, 28)))
+            using (Pen borde = new Pen(Estetica.ColorBorde, 1.2f))
+            {
+                g.FillPath(fondo, path);
+                g.DrawPath(borde, path);
+            }
+
+            // Lupa transparente
+            using (Pen lapizLupa = new Pen(Color.FromArgb(160, 255, 255, 255), 1.8f))
+            {
+                g.DrawEllipse(lapizLupa, 10, 10, 10, 10);
+                g.DrawLine(lapizLupa, 18, 18, 23, 23);
+            }
+        }
+
+        private static GraphicsPath RutaCapsula(Rectangle r)
+        {
+            GraphicsPath path = new GraphicsPath();
+            int d = Math.Max(2, r.Height);
+            path.AddArc(r.X, r.Y, d, d, 90, 180);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 180);
+            path.CloseFigure();
+            return path;
         }
     }
 }

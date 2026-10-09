@@ -710,7 +710,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
         // todavía, esto lo detecta igual porque mide cuánto hace que NO llega un fotograma nuevo.
         private void IniciarMonitorConexion()
         {
-            lblIP.Text = $"XIAO: {ipCamara}";
+            lblIP.Text = $"IP: {ipCamara}";
             Estetica.EstilizarIndicadorConexion(lblIndicadorConexion);
             lblIndicadorConexion.ForeColor = Estetica.ColorPeligro;
             lblEstadoConexion.Text = "Desconectado";
