@@ -156,6 +156,12 @@ namespace Proyecto_ReconocimientoFacial_0._1
         private readonly object lockFrame = new object();
         private byte[] ultimoJpeg;
         private readonly AutoResetEvent nuevoFrame = new AutoResetEvent(false);
+        // Visualización independiente del procesamiento
+        private byte[] ultimoJpegVisor;
+        private readonly AutoResetEvent nuevoFrameVisor = new AutoResetEvent(false);
+        private volatile SuperposicionFrame superposicionPublicada;
+        private const int MS_VIGENCIA_SUPERPOSICION = 700; // si el último resultado es más viejo, no se dibuja
+
         private static readonly byte[] SOI = { 0xFF, 0xD8 };
         private static readonly byte[] EOI = { 0xFF, 0xD9 };
 
@@ -190,10 +196,13 @@ namespace Proyecto_ReconocimientoFacial_0._1
             public EtiquetaRostro Rostro;
             public string Pie;
             public Color ColorPie;
+            public DateTime Creada; // momento en que ProcessFrame terminó de armarla
         }
 
         // Todos estos campos los toca únicamente el hilo de procesamiento (dentro de ProcessFrame).
         private SuperposicionFrame superposicion = new SuperposicionFrame();
+        private DateTime ultimaActualizacionMetricas = DateTime.MinValue;
+        private const int MS_ENTRE_METRICAS = 200; // máx. ~5 actualizaciones por segundo
         private string guiaCruda;      // indicación que pide el fotograma ACTUAL (null = todo bien); aún sin filtrar
         private string pieEstadoTexto; // estado normal del fotograma actual (presente, no registrado, registrando...)
         private Color pieEstadoColor;
@@ -393,24 +402,32 @@ namespace Proyecto_ReconocimientoFacial_0._1
         }
 
         // Refresca la grilla del panel de administración (siempre desde el hilo de UI)
+
         private void ActualizarGrilla()
         {
             if (!sqlDisponible) return;
 
-            EjecutarEnUI(() =>
+            string filtro = filtroBusquedaActivo; // se captura acá: la consulta corre en otro hilo
+
+            Task.Run(() =>
             {
+                DataTable tabla;
                 try
                 {
-                    // Si hay una búsqueda activa se refresca ESA búsqueda: el reconocimiento llama a
-                    // ActualizarGrilla() cada vez que marca a alguien presente y no debe borrar el resultado.
-                    string filtro = filtroBusquedaActivo;
-                    DataTable tabla = (filtro == null) ? administradorSQL.ObtenerTodos() : administradorSQL.Buscar(filtro);
-                    MostrarTablaEnGrilla(tabla);
+                    tabla = (filtro == null) ? administradorSQL.ObtenerTodos() : administradorSQL.Buscar(filtro);
                 }
                 catch (Exception ex)
                 {
                     LogMensaje($"[AVISO] No se pudo actualizar la grilla: {ex.Message}");
+                    return;
                 }
+
+                EjecutarEnUI(() =>
+                {
+                    if (filtro != filtroBusquedaActivo) return; // la búsqueda cambió mientras se consultaba
+                    try { MostrarTablaEnGrilla(tabla); }
+                    catch (Exception ex) { LogMensaje($"[AVISO] No se pudo mostrar la grilla: {ex.Message}"); }
+                });
             });
         }
 
@@ -831,6 +848,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
                                   TaskCreationOptions.LongRunning, TaskScheduler.Default);
             Task.Factory.StartNew(() => BucleProcesamiento(token), token,
                                   TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            Task.Factory.StartNew(() => BucleVisualizacion(token), token,
+                      TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
         private void CaptureMjpegStream(string url, CancellationToken token)
@@ -846,7 +865,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 try
                 {
                     request = (HttpWebRequest)WebRequest.Create(url);
-                    request.Timeout = 10000;
+                    request.Timeout = 5000;
                     request.ReadWriteTimeout = 8000;   // si la ESP32 se cuelga, se reconecta en vez de bloquearse para siempre
                     request.KeepAlive = false;
                     request.AllowReadStreamBuffering = false;
@@ -880,7 +899,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                     if (!token.IsCancellationRequested && !isDisposing)
                     {
                         LogMensaje($"[STREAM] {ex.Message}. Reintentando...");
-                        token.WaitHandle.WaitOne(2000);
+                        token.WaitHandle.WaitOne(1000);
                     }
                 }
                 finally
@@ -949,9 +968,10 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
         private void PublicarFrame(byte[] jpeg)
         {
-            lock (lockFrame) { ultimoJpeg = jpeg; } // sobrescribe: siempre se procesa el fotograma MÁS RECIENTE
+            lock (lockFrame) { ultimoJpeg = jpeg; ultimoJpegVisor = jpeg; } // sobrescribe: siempre el MÁS RECIENTE
             ultimoFrameRecibido = DateTime.Now;
             nuevoFrame.Set();
+            nuevoFrameVisor.Set();
         }
 
         // ------------------------------------------------------------------
@@ -978,6 +998,38 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 catch (Exception ex)
                 {
                     System.Diagnostics.Debug.WriteLine($"[PROCESO] {ex.Message}");
+                }
+            }
+        }
+
+        // Hilo de visualización: muestra cada fotograma apenas llega, SIN esperar al reconocimiento.
+        private void BucleVisualizacion(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested && !isDisposing)
+            {
+                if (!nuevoFrameVisor.WaitOne(500)) continue;
+
+                byte[] jpeg;
+                lock (lockFrame) { jpeg = ultimoJpegVisor; ultimoJpegVisor = null; }
+                if (jpeg == null) continue;
+
+                try
+                {
+                    using (Mat frame = new Mat())
+                    {
+                        CvInvoke.Imdecode(jpeg, ImreadModes.Color, frame);
+                        if (frame.IsEmpty) continue;
+
+                        SuperposicionFrame sp = superposicionPublicada;
+                        if (sp != null && (DateTime.Now - sp.Creada).TotalMilliseconds > MS_VIGENCIA_SUPERPOSICION)
+                            sp = null; // procesamiento demorado: mejor video limpio que un recuadro desfasado
+
+                        MostrarFrame(frame, sp);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[VISOR] {ex.Message}");
                 }
             }
         }
@@ -1019,6 +1071,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                             // Durante un registro, que no haya rostro también se le indica al usuario en pantalla
                             if (registroActivo) guiaCruda = MSG_CENTRO;
                             ResetearEstadoSiNoHayRostro();
+                            ActualizarMetricas(null, null, null);
                         }
                         else
                         {
@@ -1033,7 +1086,9 @@ namespace Proyecto_ReconocimientoFacial_0._1
             }
 
             ComponerPie();
-            MostrarFrame(frame, superposicion);
+            // Se publica el resultado terminado; el hilo de visualización lo dibuja sobre el video en vivo.
+            superposicion.Creada = DateTime.Now;
+            superposicionPublicada = superposicion;
         }
 
         // Corre YuNet sobre una copia reducida si el frame es grande; el frame original no se toca.
@@ -1110,6 +1165,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             {
                 MarcarRostro(rect, null, COLOR_AMARILLO);
                 guiaCruda = MSG_ACERCARSE;
+                ActualizarMetricas(null, data[o + 14], null);   // <- NUEVA
                 return;
             }
 
@@ -1135,6 +1191,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                     {
                         // Sobre el rostro solo va el recuadro; el progreso se muestra al pie.
                         MarcarRostro(rect, null, COLOR_AZUL);
+                        ActualizarMetricas(null, data[o + 14], null);
                         pieEstadoTexto = $"Registrando... {muestrasRegistro.Count}/{MUESTRAS_REGISTRO}. {MSG_QUIETO}";
                         pieEstadoColor = COLOR_AZUL;
                     }
@@ -1151,6 +1208,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 {
                     MarcarRostro(rect, null, COLOR_AMARILLO);
                     guiaCruda = motivoRechazo; // el filtro decide si ya es momento de mostrarla
+                    ActualizarMetricas(nitidezReconocimiento, data[o + 14], null);
                     return; // no se arriesga una identificación con un rostro que no cumple el estándar mínimo
                 }
 
@@ -1189,8 +1247,10 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 bool conocido = !analizando && identidad != "Desconocido";
                 Color color = analizando ? COLOR_AMARILLO : (conocido ? COLOR_VERDE : COLOR_ROJO);
 
-                // Sobre el rostro SOLO: "Desconocido" o "[Nombre]" + score al lado (como antes).
-                MarcarRostro(rect, $"{identidad} ({simPromedio:F2})", color);
+                // Solo el recuadro de color; el nombre y el estado van únicamente al pie.
+                MarcarRostro(rect, null, color);
+                ActualizarMetricas(nitidezReconocimiento, data[o + 14], simPromedio);
+
 
                 // Mensaje al pie de la imagen
                 if (analizando)
@@ -1205,7 +1265,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 }
                 else
                 {
-                    pieEstadoTexto = "No está registrado en el sistema";
+                    pieEstadoTexto = "Desconocido: no está registrado en el sistema"; 
                     pieEstadoColor = COLOR_ROJO;
                 }
 
@@ -1260,6 +1320,29 @@ namespace Proyecto_ReconocimientoFacial_0._1
             superposicion.Rostro = new EtiquetaRostro { Rect = rect, Texto = texto, Color = color };
         }
 
+        // ------------------------------------------------------------------
+        // MÉTRICAS EN VIVO
+        // ------------------------------------------------------------------
+        // Se llama desde el hilo de procesamiento. Un valor null significa "no disponible" y se muestra "--".
+        private void ActualizarMetricas(double? nitidez, double? confianzaYuNet, double? similitud)
+        {
+            DateTime ahora = DateTime.Now;
+            if ((ahora - ultimaActualizacionMetricas).TotalMilliseconds < MS_ENTRE_METRICAS) return;
+            ultimaActualizacionMetricas = ahora;
+
+            string sNitidez = (nitidez.HasValue && nitidez.Value > 0) ? nitidez.Value.ToString("F0") : "--";
+            string sConfianza = confianzaYuNet.HasValue ? (confianzaYuNet.Value * 100.0).ToString("F0") + "%" : "--";
+            string sSimilitud = similitud.HasValue ? similitud.Value.ToString("F2") : "--";
+
+            string texto =
+                "MÉTRICAS EN VIVO:" + Environment.NewLine +
+                "--------------" + Environment.NewLine +
+                $"NITIDEZ (Fija: >{UMBRAL_NITIDEZ_RECONOCER:F0}):  {sNitidez}" + Environment.NewLine +
+                $"CONFIDENCIA (YuNet):  {sConfianza}" + Environment.NewLine +
+                $"SIMILITUD (Fija: >{UMBRAL_SFACE:F2}):  {sSimilitud}";
+
+            EjecutarEnUI(() => lblMetricas.Text = texto);
+        }
         // Elige qué mensaje va al pie. Prioridad: 1) mensaje temporal (ej. "Usted ha sido registrado"),
         // 2) indicación de posicionamiento ya filtrada (sin parpadeo), 3) estado normal (presente, etc.).
         private void ComponerPie()
@@ -1792,6 +1875,11 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 foreach (PersonaRegistrada p in listaPersonas) p.Dispose();
                 listaPersonas.Clear();
             }
+        }
+
+        private void label1_Click(object sender, EventArgs e)
+        {
+
         }
     }
 

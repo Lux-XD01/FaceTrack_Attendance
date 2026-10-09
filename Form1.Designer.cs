@@ -43,6 +43,7 @@
             this.lblIndicadorConexion = new System.Windows.Forms.Label();
             this.lblEstadoConexion = new System.Windows.Forms.Label();
             this.panelTemperatura = new System.Windows.Forms.Panel();
+            this.lblMetricas = new System.Windows.Forms.Label();
             ((System.ComponentModel.ISupportInitialize)(this.pictureBox1)).BeginInit();
             ((System.ComponentModel.ISupportInitialize)(this.dgvAlumnos)).BeginInit();
             this.SuspendLayout();
@@ -206,11 +207,22 @@
             this.panelTemperatura.TabIndex = 0;
             this.panelTemperatura.Paint += new System.Windows.Forms.PaintEventHandler(this.panelTemperatura_Paint);
             // 
+            // lblMetricas
+            // 
+            this.lblMetricas.AutoSize = true;
+            this.lblMetricas.Location = new System.Drawing.Point(590, 672);
+            this.lblMetricas.Name = "lblMetricas";
+            this.lblMetricas.Size = new System.Drawing.Size(44, 16);
+            this.lblMetricas.TabIndex = 15;
+            this.lblMetricas.Text = "label4";
+            this.lblMetricas.Click += new System.EventHandler(this.label1_Click);
+            // 
             // Form1
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(8F, 16F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
             this.ClientSize = new System.Drawing.Size(1633, 875);
+            this.Controls.Add(this.lblMetricas);
             this.Controls.Add(this.panelTemperatura);
             this.Controls.Add(this.lblEstadoConexion);
             this.Controls.Add(this.lblIndicadorConexion);
@@ -253,6 +265,7 @@
         private System.Windows.Forms.Label lblIndicadorConexion;
         private System.Windows.Forms.Label lblEstadoConexion;
         private System.Windows.Forms.Panel panelTemperatura;
+        private System.Windows.Forms.Label lblMetricas;
     }
 }
 
