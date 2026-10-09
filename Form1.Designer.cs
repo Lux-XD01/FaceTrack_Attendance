@@ -34,7 +34,6 @@
             this.textBox3 = new System.Windows.Forms.TextBox();
             this.dgvAlumnos = new System.Windows.Forms.DataGridView();
             this.txtBuscar = new System.Windows.Forms.TextBox();
-            this.btnBuscar = new System.Windows.Forms.Button();
             this.btnRegistrar = new System.Windows.Forms.Button();
             this.btnBorrarTodo = new System.Windows.Forms.Button();
             this.btnGuardarEdiciones = new System.Windows.Forms.Button();
@@ -95,7 +94,7 @@
             this.dgvAlumnos.Name = "dgvAlumnos";
             this.dgvAlumnos.RowHeadersWidth = 51;
             this.dgvAlumnos.RowTemplate.Height = 24;
-            this.dgvAlumnos.Size = new System.Drawing.Size(653, 402);
+            this.dgvAlumnos.Size = new System.Drawing.Size(835, 402);
             this.dgvAlumnos.TabIndex = 4;
             // 
             // txtBuscar
@@ -103,23 +102,9 @@
             this.txtBuscar.Location = new System.Drawing.Point(733, 420);
             this.txtBuscar.Multiline = true;
             this.txtBuscar.Name = "txtBuscar";
-            this.txtBuscar.ReadOnly = true;
             this.txtBuscar.ScrollBars = System.Windows.Forms.ScrollBars.Both;
             this.txtBuscar.Size = new System.Drawing.Size(541, 55);
             this.txtBuscar.TabIndex = 5;
-            // 
-            // btnBuscar
-            // 
-            this.btnBuscar.BackColor = System.Drawing.SystemColors.ActiveCaption;
-            this.btnBuscar.BackgroundImageLayout = System.Windows.Forms.ImageLayout.Center;
-            this.btnBuscar.Cursor = System.Windows.Forms.Cursors.Hand;
-            this.btnBuscar.Location = new System.Drawing.Point(733, 481);
-            this.btnBuscar.Name = "btnBuscar";
-            this.btnBuscar.Size = new System.Drawing.Size(134, 34);
-            this.btnBuscar.TabIndex = 6;
-            this.btnBuscar.Text = "Buscar";
-            this.btnBuscar.UseVisualStyleBackColor = false;
-            this.btnBuscar.Click += new System.EventHandler(this.btnBuscar_Click);
             // 
             // btnRegistrar
             // 
@@ -236,7 +221,6 @@
             this.Controls.Add(this.btnGuardarEdiciones);
             this.Controls.Add(this.btnBorrarTodo);
             this.Controls.Add(this.btnRegistrar);
-            this.Controls.Add(this.btnBuscar);
             this.Controls.Add(this.txtBuscar);
             this.Controls.Add(this.textBox3);
             this.Controls.Add(this.textBox2);
@@ -260,7 +244,6 @@
         private System.Windows.Forms.TextBox textBox3;
         private System.Windows.Forms.DataGridView dgvAlumnos;
         private System.Windows.Forms.TextBox txtBuscar;
-        private System.Windows.Forms.Button btnBuscar;
         private System.Windows.Forms.Button btnRegistrar;
         private System.Windows.Forms.Button btnBorrarTodo;
         private System.Windows.Forms.Button btnGuardarEdiciones;

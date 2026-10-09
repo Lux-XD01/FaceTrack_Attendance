@@ -1,13 +1,23 @@
-// RECONOCIMIENTO FACIAL - VERSIÓN CORREGIDA (v3)
+// RECONOCIMIENTO FACIAL - VERSIÓN CORREGIDA (v4)
 // Emgu.CV 4.8.0.5324 | YuNet (detección) + SFace (reconocimiento) | XIAO ESP32S3 (stream MJPEG)
 // SQL Server para persistencia de asistencia y plantillas biométricas.
 //
 // CONTROLES REQUERIDOS EN EL DISEÑADOR (agregarlos a mano, ver instrucciones del chat):
-//   DataGridView dgvAlumnos | TextBox txtBuscar | Button btnBuscar | Button btnRegistrar
+//   DataGridView dgvAlumnos | TextBox txtBuscar | Button btnRegistrar
 //   Button btnBorrarTodo | Button btnGuardarEdiciones | Button btnEliminarSeleccionado
 //   Button btnActualizarGrilla
 //
-// Cambios respecto a la versión anterior:
+// Cambios v4:
+//   - Texto sobre el video dibujado con GDI+ (Unicode): ya no salen "?" en tildes, "ñ", "¿", "¡".
+//   - Sobre el recuadro solo va "Desconocido" / "[Nombre] (score)". Las indicaciones van al pie, con color.
+//   - Textos de indicación en forma de "usted", según el Word de objetivos.
+//   - Anti-parpadeo: histéresis del score de detección (entra a 0.72, sale a 0.68) + filtro temporal
+//     de mensajes (FiltroMensajeGuia).
+//   - txtBuscar: Enter busca y vacía la caja; si no existe, aviso en la caja; clic en la caja restaura la grilla.
+//     Se elimina btnBuscar.
+//   - Al renombrar en la grilla se vacían los votos del reconocimiento (evita un desfase de ~0.5 s).
+//
+// Cambios respecto a la versión anterior (v3):
 //   - Se reemplazaron las teclas ESPACIO/SUPR por botones (btnRegistrar / btnBorrarTodo).
 //   - btnBorrarTodo pide confirmación DOS veces antes de borrar.
 //   - Persistencia en SQL Server: al registrar, la plantilla se guarda en la base; al reconocer,
@@ -24,6 +34,8 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -42,7 +54,12 @@ namespace Proyecto_ReconocimientoFacial_0._1
         // ------------------------------------------------------------------
         private const float UMBRAL_SFACE = 0.363f;        // Similitud coseno mínima (valor recomendado por OpenCV)
         private const float MARGEN_AMBIGUO = 0.08f;       // Diferencia mínima entre 1er y 2do candidato para confiar
-        private const float SCORE_DETECCION = 0.7f;       // Confianza mínima de YuNet para considerar un rostro
+        // Histéresis del score de YuNet: para EMPEZAR a seguir un rostro hace falta score >= ENTRADA; una vez
+        // seguido, se lo conserva mientras el score sea >= SALIDA. Con un único umbral (antes 0.7) un score que
+        // oscila entre 0.68 y 0.72 hacía aparecer/desaparecer el rostro y sus mensajes a cada fotograma.
+        private const float SCORE_DETECCION_ENTRADA = 0.72f;
+        private const float SCORE_DETECCION_SALIDA = 0.68f;
+        private const int MS_MANTENER_SEGUIMIENTO = 800;  // tiempo sin ver rostro antes de exigir de nuevo el score de ENTRADA
         private const float SCORE_REGISTRO = 0.9f;        // Confianza exigida al REGISTRAR
         private const int MIN_LADO_RECONOCER = 50;        // Lado mínimo (px, resolución original) para reconocer
         private const int MIN_LADO_REGISTRO = 70;         // Lado mínimo (px, resolución original) para registrar
@@ -67,9 +84,30 @@ namespace Proyecto_ReconocimientoFacial_0._1
         private const string ESTADO_ANALIZANDO = "Analizando...";
         private const string ESTADO_AMBIGUO = "Verificando...";
 
+        // Si un rostro toca el borde y ocupa más que esta fracción del fotograma, se considera "demasiado cerca"
+        // (mensaje "Aléjese"); si es más chico, simplemente está corrido ("Póngase en el centro").
+        private const float FRACCION_ROSTRO_DEMASIADO_CERCA = 0.55f;
+
+        // Filtro anti-parpadeo de las indicaciones al pie (ver FiltroMensajeGuia)
+        private const int RETARDO_APARICION_GUIA_MS = 400;     // el problema debe persistir este tiempo para mostrarse
+        private const int RETARDO_DESAPARICION_GUIA_MS = 700;  // el rostro debe estar bien este tiempo para ocultarla
+        private const int MIN_VISIBLE_GUIA_MS = 1200;          // una vez mostrada, se queda al menos esto
+        private const int MS_PIE_REGISTRADO = 4000;            // duración de "Usted ha sido registrado en el sistema"
+
+        // Textos de indicación para el usuario (forma "usted", como en el Word de objetivos)
+        private const string MSG_ACERCARSE = "Acérquese a la cámara";
+        private const string MSG_ALEJARSE = "Aléjese de la cámara";
+        private const string MSG_CENTRO = "Póngase en el centro";
+        private const string MSG_QUIETO = "Manténgase quieto";
+        private const string MSG_DE_FRENTE = "Mire de frente a la cámara";
+        private const string MSG_NIVELAR = "Mantenga la cabeza derecha";
+        private const string MSG_POCA_LUZ = "Falta luz: ilumine su rostro de frente";
+        private const string MSG_MUCHA_LUZ = "Demasiada luz directa sobre su rostro";
+        private const string MSG_LUZ_LATERAL = "Luz de costado: póngase de frente a la luz";
+
         // Cámara ESP32 - debe coincidir EXACTO con la IP fija que pusiste en el .ino (local_IP).
         // Si volvés a cambiar la IP fija en el firmware, actualizala también acá.
-        private readonly string ipCamara = "192.168.1.105";
+        private readonly string ipCamara = "192.168.1.112";
         private readonly string streamUrl;
         private readonly string tempUrl;
         private readonly TimeSpan intervaloTemp = TimeSpan.FromSeconds(20);
@@ -131,10 +169,39 @@ namespace Proyecto_ReconocimientoFacial_0._1
         // podía reciclar un nombre ya usado (el bug de "dos Sujeto 2" que viste). Este contador solo sube.
         private int proximoIdLocalFallback = 0;
 
-        private static readonly MCvScalar COLOR_VERDE = new MCvScalar(0, 255, 0);
-        private static readonly MCvScalar COLOR_ROJO = new MCvScalar(0, 0, 255);
-        private static readonly MCvScalar COLOR_AMARILLO = new MCvScalar(0, 255, 255);
-        private static readonly MCvScalar COLOR_AZUL = new MCvScalar(255, 128, 0);
+        // Mismos tonos que antes (antes eran MCvScalar en orden BGR; ahora son Color de GDI+, en RGB).
+        private static readonly Color COLOR_VERDE = Color.FromArgb(0, 255, 0);
+        private static readonly Color COLOR_ROJO = Color.FromArgb(255, 0, 0);
+        private static readonly Color COLOR_AMARILLO = Color.FromArgb(255, 255, 0);
+        private static readonly Color COLOR_AZUL = Color.FromArgb(0, 128, 255);
+
+        // ------------------------------------------------------------------
+        // SUPERPOSICIÓN SOBRE EL VIDEO (datos; el dibujo está en DibujarSuperposicion)
+        // ------------------------------------------------------------------
+        private sealed class EtiquetaRostro
+        {
+            public Rectangle Rect;
+            public string Texto;   // null = solo recuadro, sin texto
+            public Color Color;
+        }
+
+        private sealed class SuperposicionFrame
+        {
+            public EtiquetaRostro Rostro;
+            public string Pie;
+            public Color ColorPie;
+        }
+
+        // Todos estos campos los toca únicamente el hilo de procesamiento (dentro de ProcessFrame).
+        private SuperposicionFrame superposicion = new SuperposicionFrame();
+        private string guiaCruda;      // indicación que pide el fotograma ACTUAL (null = todo bien); aún sin filtrar
+        private string pieEstadoTexto; // estado normal del fotograma actual (presente, no registrado, registrando...)
+        private Color pieEstadoColor;
+        private string pieTemporalTexto;
+        private Color pieTemporalColor;
+        private DateTime pieTemporalHasta = DateTime.MinValue;
+        private readonly FiltroMensajeGuia filtroGuia =
+            new FiltroMensajeGuia(RETARDO_APARICION_GUIA_MS, RETARDO_DESAPARICION_GUIA_MS, MIN_VISIBLE_GUIA_MS);
 
         // Historial de temperatura para el gráfico (reemplaza el log de texto repetitivo)
         private readonly object lockHistorialTemp = new object();
@@ -157,6 +224,13 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
             Estetica.AplicarEstilo(this);
 
+            // txtBuscar: se guarda el color de texto ya estilizado para poder restaurarlo tras mostrar el aviso en rojo
+            colorTextoBuscarOriginal = txtBuscar.ForeColor;
+            txtBuscar.KeyDown += txtBuscar_KeyDown;
+            txtBuscar.KeyPress += txtBuscar_KeyPress;
+            txtBuscar.Click += (s, e) => RestaurarBusqueda();  // clic con el mouse
+            txtBuscar.Enter += (s, e) => RestaurarBusqueda();  // entrar con Tab
+
             // El PictureBox se ajusta al tamaño que le diste en el diseñador, sin importar la
             // resolución real de la cámara (esto es lo que resuelve el desborde con FRAMESIZE_HVGA).
             // Esto queda en Form1 porque es parte de cómo se muestra el stream, no de la paleta visual.
@@ -167,7 +241,6 @@ namespace Proyecto_ReconocimientoFacial_0._1
             // (o descomentá estas líneas si preferís engancharlos acá):
             // btnRegistrar.Click += btnRegistrar_Click;
             // btnBorrarTodo.Click += btnBorrarTodo_Click;
-            // btnBuscar.Click += btnBuscar_Click;
             // btnGuardarEdiciones.Click += btnGuardarEdiciones_Click;
             // btnEliminarSeleccionado.Click += btnEliminarSeleccionado_Click;
             // btnActualizarGrilla.Click += btnActualizarGrilla_Click;
@@ -206,7 +279,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                     model: pathDetector,
                     config: "",
                     inputSize: new Size(320, 320),
-                    scoreThreshold: SCORE_DETECCION,
+                    scoreThreshold: SCORE_DETECCION_SALIDA,
                     nmsThreshold: 0.3f,
                     topK: 5000,
                     backendId: Emgu.CV.Dnn.Backend.OpenCV,
@@ -328,19 +401,29 @@ namespace Proyecto_ReconocimientoFacial_0._1
             {
                 try
                 {
-                    DataTable tabla = administradorSQL.ObtenerTodos();
-                    dgvAlumnos.DataSource = tabla;
-                    dgvAlumnos.AllowUserToAddRows = false; // sin esto, la fila en blanco del final intenta crear un alumno sin Plantilla
-
-                    if (dgvAlumnos.Columns["Id"] != null) dgvAlumnos.Columns["Id"].ReadOnly = true;
-                    if (dgvAlumnos.Columns["Estado"] != null) dgvAlumnos.Columns["Estado"].ReadOnly = true;
-                    if (dgvAlumnos.Columns["FechaHora"] != null) dgvAlumnos.Columns["FechaHora"].ReadOnly = true;
+                    // Si hay una búsqueda activa se refresca ESA búsqueda: el reconocimiento llama a
+                    // ActualizarGrilla() cada vez que marca a alguien presente y no debe borrar el resultado.
+                    string filtro = filtroBusquedaActivo;
+                    DataTable tabla = (filtro == null) ? administradorSQL.ObtenerTodos() : administradorSQL.Buscar(filtro);
+                    MostrarTablaEnGrilla(tabla);
                 }
                 catch (Exception ex)
                 {
                     LogMensaje($"[AVISO] No se pudo actualizar la grilla: {ex.Message}");
                 }
             });
+        }
+
+        // Asigna la tabla a la grilla y reaplica sus reglas. Antes la búsqueda asignaba el DataSource sin
+        // reaplicar los ReadOnly, por lo que tras buscar las columnas Id/Estado/FechaHora podían quedar editables.
+        private void MostrarTablaEnGrilla(DataTable tabla)
+        {
+            dgvAlumnos.DataSource = tabla;
+            dgvAlumnos.AllowUserToAddRows = false; // sin esto, la fila en blanco del final intenta crear un alumno sin Plantilla
+
+            if (dgvAlumnos.Columns["Id"] != null) dgvAlumnos.Columns["Id"].ReadOnly = true;
+            if (dgvAlumnos.Columns["Estado"] != null) dgvAlumnos.Columns["Estado"].ReadOnly = true;
+            if (dgvAlumnos.Columns["FechaHora"] != null) dgvAlumnos.Columns["FechaHora"].ReadOnly = true;
         }
 
         private static byte[] VectorABytes(float[] v)
@@ -388,22 +471,91 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
         private void btnActualizarGrilla_Click(object sender, EventArgs e)
         {
+            RestaurarBusqueda(); // "Actualizar" siempre vuelve a mostrar a todos
             ActualizarGrilla();
         }
 
-        private void btnBuscar_Click(object sender, EventArgs e)
+        // ---- Búsqueda (txtBuscar) ----
+        // Flujo: Enter -> se busca y la caja se vacía.
+        //   - Si hay resultados: la grilla queda filtrada y la caja vacía.
+        //   - Si NO hay: la grilla queda vacía y la caja muestra el aviso en rojo.
+        // Al hacer clic en la caja (o al empezar a escribir sobre el aviso) se borra el aviso y la grilla
+        // vuelve a mostrar a todos.
+        private string filtroBusquedaActivo = null;   // null = la grilla muestra a todos
+        private bool mensajeBusquedaVisible = false;  // true = txtBuscar contiene el aviso de "no está en la base"
+        private Color colorTextoBuscarOriginal;
+
+        private void txtBuscar_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Enter) return;
+
+            e.Handled = true;
+            e.SuppressKeyPress = true; // evita el "ding" de Windows al presionar Enter en un TextBox de una línea
+            EjecutarBusqueda();
+        }
+
+        // KeyPress solo se dispara con teclas que producen un carácter (no con Shift, flechas, etc.).
+        // Si el aviso está en pantalla, se borra ANTES de que entre la letra nueva.
+        private void txtBuscar_KeyPress(object sender, KeyPressEventArgs e)
+        {
+            if (mensajeBusquedaVisible) RestaurarBusqueda();
+        }
+
+        private void EjecutarBusqueda()
         {
             if (!sqlDisponible) { MostrarEstado("SQL Server no está disponible."); return; }
 
+            string texto = txtBuscar.Text.Trim();
+
+            // Enter con la caja vacía = volver a ver a todos
+            if (texto.Length == 0)
+            {
+                RestaurarBusqueda();
+                return;
+            }
+
             try
             {
-                DataTable tabla = administradorSQL.Buscar(txtBuscar.Text);
-                dgvAlumnos.DataSource = tabla;
+                DataTable tabla = administradorSQL.Buscar(texto);
+
+                filtroBusquedaActivo = texto; // así los refrescos automáticos (reconocimiento) no pisan el resultado
+                MostrarTablaEnGrilla(tabla);
+
+                if (tabla.Rows.Count == 0)
+                {
+                    mensajeBusquedaVisible = true;
+                    txtBuscar.ForeColor = Estetica.ColorPeligro;
+                    txtBuscar.Text = $"El usuario que está buscando {texto} no está en la base de datos.";
+                    txtBuscar.SelectionStart = 0;   // que se vea el comienzo del aviso
+                    txtBuscar.SelectionLength = 0;
+                }
+                else
+                {
+                    txtBuscar.Clear();
+                }
             }
             catch (Exception ex)
             {
                 LogMensaje($"[AVISO] Error en la búsqueda: {ex.Message}");
             }
+        }
+
+        // Deja todo como al inicio: sin filtro, sin aviso, color original. Se puede llamar las veces que sea.
+        private void RestaurarBusqueda()
+        {
+            if (!mensajeBusquedaVisible && filtroBusquedaActivo == null) return;
+
+            bool habiaMensaje = mensajeBusquedaVisible;
+
+            mensajeBusquedaVisible = false;
+            filtroBusquedaActivo = null;
+            txtBuscar.ForeColor = colorTextoBuscarOriginal;
+
+            // Solo se borra el texto si era el AVISO. Si el usuario ya escribió algo propio y hace clic
+            // para mover el cursor, no se le debe borrar lo que tipeó.
+            if (habiaMensaje) txtBuscar.Clear();
+
+            ActualizarGrilla();
         }
 
         private void btnGuardarEdiciones_Click(object sender, EventArgs e)
@@ -466,11 +618,30 @@ namespace Proyecto_ReconocimientoFacial_0._1
         {
             lock (lockObjetosNativos)
             {
+                bool huboCambio = false;
+
                 foreach (DataRow fila in tabla.Rows)
                 {
                     int id = Convert.ToInt32(fila["Id"]);
                     PersonaRegistrada persona = listaPersonas.FirstOrDefault(p => p.IdBd == id);
-                    if (persona != null) persona.Nombre = fila["Nombre"]?.ToString() ?? persona.Nombre;
+                    if (persona == null) continue;
+
+                    string nuevoNombre = fila["Nombre"]?.ToString() ?? persona.Nombre;
+                    if (nuevoNombre != persona.Nombre)
+                    {
+                        persona.Nombre = nuevoNombre;
+                        huboCambio = true;
+                    }
+                }
+
+                // Los votos de reconocimiento (ultimosVotos) guardan el nombre VIEJO como texto. Si no se
+                // vacían, durante ~7 fotogramas la identidad confirmada sería un nombre que ya no existe,
+                // y no se encontraría a la persona para marcarla presente. Se vacían dentro del mismo lock
+                // que usa el hilo de procesamiento, así que no hay carrera.
+                if (huboCambio)
+                {
+                    ultimosVotos.Clear();
+                    ultimoSujetoNotificado = "";
                 }
             }
         }
@@ -815,6 +986,12 @@ namespace Proyecto_ReconocimientoFacial_0._1
         {
             if (isDisposing || IsDisposed) return;
 
+            // Cada fotograma arranca con la superposición vacía (recuadro + etiqueta del rostro y mensaje
+            // al pie). Se llena durante el procesamiento y recién se dibuja en MostrarFrame, con GDI+.
+            superposicion = new SuperposicionFrame();
+            guiaCruda = null;
+            pieEstadoTexto = null;
+
             try
             {
                 lock (lockObjetosNativos)
@@ -839,7 +1016,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
                         if (idx < 0)
                         {
-                            if (registroActivo) MostrarEstado("Registro: no se detecta ningún rostro. Colócate frente a la cámara.");
+                            // Durante un registro, que no haya rostro también se le indica al usuario en pantalla
+                            if (registroActivo) guiaCruda = MSG_CENTRO;
                             ResetearEstadoSiNoHayRostro();
                         }
                         else
@@ -854,7 +1032,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 System.Diagnostics.Debug.WriteLine($"Error procesando fotograma: {ex.Message}");
             }
 
-            MostrarFrame(frame);
+            ComponerPie();
+            MostrarFrame(frame, superposicion);
         }
 
         // Corre YuNet sobre una copia reducida si el frame es grande; el frame original no se toca.
@@ -898,10 +1077,14 @@ namespace Proyecto_ReconocimientoFacial_0._1
             int mejor = -1;
             float mayorArea = 0f;
 
+            // Histéresis: si ya se venía siguiendo un rostro hace poco, alcanza con SALIDA; si no, se exige ENTRADA.
+            bool seguimientoActivo = (DateTime.Now - ultimoRostroVisto).TotalMilliseconds < MS_MANTENER_SEGUIMIENTO;
+            float scoreMinimo = seguimientoActivo ? SCORE_DETECCION_SALIDA : SCORE_DETECCION_ENTRADA;
+
             for (int i = 0; i < faces.Rows; i++)
             {
                 int o = i * faces.Cols;
-                if (data[o + 14] < SCORE_DETECCION) continue;
+                if (data[o + 14] < scoreMinimo) continue;
 
                 float area = data[o + 2] * data[o + 3];
                 if (area > mayorArea) { mayorArea = area; mejor = i; }
@@ -921,10 +1104,12 @@ namespace Proyecto_ReconocimientoFacial_0._1
             rect = Rectangle.Intersect(rect, new Rectangle(0, 0, frame.Width, frame.Height));
             if (rect.Width < 20 || rect.Height < 20) return;
 
-            // Rostro demasiado pequeño para reconocer con fiabilidad (sube la resolución de la cámara o acércate)
+            // Rostro demasiado pequeño para reconocer con fiabilidad. La indicación va al pie de la imagen
+            // (no sobre el rostro) y pasa por el filtro anti-parpadeo.
             if (!registroActivo && (w < MIN_LADO_RECONOCER || h < MIN_LADO_RECONOCER))
             {
-                DibujarRostro(frame, rect, "Muy lejos", COLOR_AMARILLO);
+                MarcarRostro(rect, null, COLOR_AMARILLO);
+                guiaCruda = MSG_ACERCARSE;
                 return;
             }
 
@@ -947,7 +1132,12 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 {
                     AvanzarRegistro(frame.Size, data, o, faceAligned, feature);
                     if (registroActivo)
-                        DibujarRostro(frame, rect, $"REGISTRANDO {muestrasRegistro.Count}/{MUESTRAS_REGISTRO}", COLOR_AZUL);
+                    {
+                        // Sobre el rostro solo va el recuadro; el progreso se muestra al pie.
+                        MarcarRostro(rect, null, COLOR_AZUL);
+                        pieEstadoTexto = $"Registrando... {muestrasRegistro.Count}/{MUESTRAS_REGISTRO}. {MSG_QUIETO}";
+                        pieEstadoColor = COLOR_AZUL;
+                    }
                     return;
                 }
 
@@ -959,7 +1149,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 double nitidezReconocimiento;
                 if (!EsRostroValido(frame.Size, data, o, faceAligned, paraRegistro: false, out motivoRechazo, out nitidezReconocimiento))
                 {
-                    DibujarRostro(frame, rect, motivoRechazo, COLOR_AMARILLO);
+                    MarcarRostro(rect, null, COLOR_AMARILLO);
+                    guiaCruda = motivoRechazo; // el filtro decide si ya es momento de mostrarla
                     return; // no se arriesga una identificación con un rostro que no cumple el estándar mínimo
                 }
 
@@ -996,9 +1187,27 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
                 bool analizando = (identidad == ESTADO_ANALIZANDO || identidad == ESTADO_AMBIGUO);
                 bool conocido = !analizando && identidad != "Desconocido";
-                MCvScalar color = analizando ? COLOR_AMARILLO : (conocido ? COLOR_VERDE : COLOR_ROJO);
+                Color color = analizando ? COLOR_AMARILLO : (conocido ? COLOR_VERDE : COLOR_ROJO);
 
-                DibujarRostro(frame, rect, $"{identidad} ({simPromedio:F2})", color);
+                // Sobre el rostro SOLO: "Desconocido" o "[Nombre]" + score al lado (como antes).
+                MarcarRostro(rect, $"{identidad} ({simPromedio:F2})", color);
+
+                // Mensaje al pie de la imagen
+                if (analizando)
+                {
+                    pieEstadoTexto = MSG_QUIETO;
+                    pieEstadoColor = COLOR_AMARILLO;
+                }
+                else if (conocido)
+                {
+                    pieEstadoTexto = $"{identidad} está presente";
+                    pieEstadoColor = COLOR_VERDE;
+                }
+                else
+                {
+                    pieEstadoTexto = "No está registrado en el sistema";
+                    pieEstadoColor = COLOR_ROJO;
+                }
 
                 if (!analizando)
                 {
@@ -1040,11 +1249,106 @@ namespace Proyecto_ReconocimientoFacial_0._1
             }
         }
 
-        private void DibujarRostro(Mat frame, Rectangle rect, string texto, MCvScalar color)
+        // ------------------------------------------------------------------
+        // SUPERPOSICIÓN: recuadro, etiqueta del rostro y mensaje al pie
+        // ------------------------------------------------------------------
+        // Se arma durante el procesamiento (solo guarda datos) y se dibuja en MostrarFrame con GDI+.
+        // CvInvoke.PutText usa fuentes Hershey, que SOLO tienen ASCII: cualquier tilde, "ñ", "¿" o "¡"
+        // sale como "?". GDI+ dibuja texto Unicode normal (Segoe UI), así que se ven bien.
+        private void MarcarRostro(Rectangle rect, string texto, Color color)
         {
-            CvInvoke.Rectangle(frame, rect, color, 2);
-            CvInvoke.PutText(frame, texto, new Point(rect.X, Math.Max(rect.Y - 10, 15)),
-                             FontFace.HersheySimplex, 0.6, color, 2);
+            superposicion.Rostro = new EtiquetaRostro { Rect = rect, Texto = texto, Color = color };
+        }
+
+        // Elige qué mensaje va al pie. Prioridad: 1) mensaje temporal (ej. "Usted ha sido registrado"),
+        // 2) indicación de posicionamiento ya filtrada (sin parpadeo), 3) estado normal (presente, etc.).
+        private void ComponerPie()
+        {
+            DateTime ahora = DateTime.Now;
+
+            // Se actualiza SIEMPRE (aunque haya un temporal) para que los tiempos del filtro sigan corriendo.
+            string guia = filtroGuia.Actualizar(guiaCruda, ahora);
+
+            if (pieTemporalTexto != null && ahora < pieTemporalHasta)
+            {
+                superposicion.Pie = pieTemporalTexto;
+                superposicion.ColorPie = pieTemporalColor;
+            }
+            else if (guia != null)
+            {
+                superposicion.Pie = guia;
+                superposicion.ColorPie = COLOR_AMARILLO;
+            }
+            else if (pieEstadoTexto != null)
+            {
+                superposicion.Pie = pieEstadoTexto;
+                superposicion.ColorPie = pieEstadoColor;
+            }
+        }
+
+        private void EstablecerPieTemporal(string texto, Color color, int milisegundos)
+        {
+            pieTemporalTexto = texto;
+            pieTemporalColor = color;
+            pieTemporalHasta = DateTime.Now.AddMilliseconds(milisegundos);
+        }
+
+        private static void DibujarSuperposicion(Bitmap bmp, SuperposicionFrame sp)
+        {
+            if (sp == null || (sp.Rostro == null && string.IsNullOrEmpty(sp.Pie))) return;
+
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+
+                if (sp.Rostro != null) DibujarEtiquetaRostro(g, bmp.Size, sp.Rostro);
+                if (!string.IsNullOrEmpty(sp.Pie)) DibujarPie(g, bmp.Size, sp.Pie, sp.ColorPie);
+            }
+        }
+
+        // Recuadro + texto ARRIBA del rostro (si no cabe arriba, se pone dentro del recuadro).
+        private static void DibujarEtiquetaRostro(Graphics g, Size tamano, EtiquetaRostro et)
+        {
+            using (Pen lapiz = new Pen(et.Color, 2f))
+                g.DrawRectangle(lapiz, et.Rect);
+
+            if (string.IsNullOrEmpty(et.Texto)) return;
+
+            float px = Math.Max(13f, tamano.Height * 0.045f); // el tamaño escala con la resolución del fotograma
+            using (Font fuente = new Font("Segoe UI", px, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Brush pincelTexto = new SolidBrush(et.Color))
+            using (Brush fondo = new SolidBrush(Color.FromArgb(150, 0, 0, 0)))
+            {
+                SizeF medida = g.MeasureString(et.Texto, fuente);
+                float x = Math.Min(Math.Max(et.Rect.X, 0), Math.Max(0f, tamano.Width - medida.Width));
+                float y = et.Rect.Y - medida.Height - 2;
+                if (y < 0) y = et.Rect.Y + 2;
+
+                g.FillRectangle(fondo, x, y, medida.Width, medida.Height);
+                g.DrawString(et.Texto, fuente, pincelTexto, x, y);
+            }
+        }
+
+        // Banda oscura semitransparente en la parte inferior, con el texto centrado y del color indicado.
+        private static void DibujarPie(Graphics g, Size tamano, string texto, Color color)
+        {
+            float px = Math.Max(14f, tamano.Height * 0.055f);
+            float margen = tamano.Width * 0.03f;
+            float anchoTexto = tamano.Width - 2f * margen;
+
+            using (Font fuente = new Font("Segoe UI", px, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (Brush pincelTexto = new SolidBrush(color))
+            using (Brush fondo = new SolidBrush(Color.FromArgb(170, 0, 0, 0)))
+            using (StringFormat formato = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+            {
+                SizeF medida = g.MeasureString(texto, fuente, (int)anchoTexto); // si es largo, se parte en líneas
+                float alto = medida.Height + px * 0.6f;
+                float yBanda = tamano.Height - alto;
+
+                g.FillRectangle(fondo, 0f, yBanda, tamano.Width, alto);
+                g.DrawString(texto, fuente, pincelTexto, new RectangleF(margen, yBanda, anchoTexto, alto), formato);
+            }
         }
 
         // Votación sobre los últimos fotogramas: elimina el "parpadeo" de identidades por ruido del stream
@@ -1110,7 +1414,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                     registroActivo = true;
                     inicioRegistro = DateTime.Now;
                     ultimaMuestra = DateTime.MinValue;
-                    MostrarEstado("Registro iniciado: mira de frente a la cámara y no te muevas.");
+                    MostrarEstado("Registro iniciado: mire de frente a la cámara y manténgase quieto.");
                 }
             }
 
@@ -1127,7 +1431,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
             if (!EsRostroValido(frameSize, data, o, faceAligned, paraRegistro: true, out motivo, out nitidez))
             {
-                MostrarEstado("Registro: " + motivo);
+                guiaCruda = motivo; // va al pie de la imagen, ya filtrada contra parpadeos
                 return;
             }
 
@@ -1139,7 +1443,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 double consistencia = recognizerNet.Match(muestrasRegistro[0], feature, FaceRecognizerSF.DisType.Cosine);
                 if (consistencia < UMBRAL_CONSISTENCIA)
                 {
-                    MostrarEstado("Registro: el rostro cambió. Debe haber una sola persona frente a la cámara.");
+                    guiaCruda = "Debe haber una sola persona frente a la cámara";
                     return;
                 }
             }
@@ -1173,25 +1477,28 @@ namespace Proyecto_ReconocimientoFacial_0._1
             float h = data[o + 3];
             float score = data[o + 14];
 
-            float scoreMinimo = paraRegistro ? SCORE_REGISTRO : SCORE_DETECCION;
+            // En reconocimiento se usa el umbral de SALIDA: el de ENTRADA ya se exigió en SeleccionarRostroPrincipal.
+            float scoreMinimo = paraRegistro ? SCORE_REGISTRO : SCORE_DETECCION_SALIDA;
             int ladoMinimo = paraRegistro ? MIN_LADO_REGISTRO : MIN_LADO_RECONOCER;
 
             if (score < scoreMinimo)
             {
-                motivo = "Rostro poco claro. Mejora la iluminación y mira de frente.";
+                motivo = MSG_DE_FRENTE;
                 return false;
             }
 
             if (w < ladoMinimo || h < ladoMinimo)
             {
-                motivo = "Acércate un poco a la cámara.";
+                motivo = MSG_ACERCARSE;
                 return false;
             }
 
             if (x < MARGEN_BORDE || y < MARGEN_BORDE ||
                 x + w > frameSize.Width - MARGEN_BORDE || y + h > frameSize.Height - MARGEN_BORDE)
             {
-                motivo = "Tu rostro toca el borde de la imagen. Aléjate un poco y céntrate.";
+                // Rostro cortado por el borde: si es grande, está demasiado cerca; si es chico, está corrido.
+                bool demasiadoCerca = Math.Max(w / frameSize.Width, h / frameSize.Height) > FRACCION_ROSTRO_DEMASIADO_CERCA;
+                motivo = demasiadoCerca ? MSG_ALEJARSE : MSG_CENTRO;
                 return false;
             }
 
@@ -1205,7 +1512,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
             if (anguloRoll > 12.0)
             {
-                motivo = "Mantén la cabeza nivelada (sin ladearla).";
+                motivo = MSG_NIVELAR;
                 return false;
             }
 
@@ -1219,23 +1526,21 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
             if (relacionYaw < UMBRAL_YAW_MIN || relacionYaw > UMBRAL_YAW_MAX)
             {
-                motivo = "Mira directamente de frente a la cámara (de perfil no se reconoce).";
+                motivo = MSG_DE_FRENTE;
                 return false;
             }
 
             double brillo = CalcularBrillo(faceAligned);
             if (brillo < BRILLO_MIN || brillo > BRILLO_MAX)
             {
-                motivo = brillo < BRILLO_MIN
-                    ? "Demasiado oscuro / a contraluz. Ilumina tu rostro de frente."
-                    : "Demasiada luz directa sobre el rostro.";
+                motivo = brillo < BRILLO_MIN ? MSG_POCA_LUZ : MSG_MUCHA_LUZ;
                 return false;
             }
 
             double asimetria = CalcularAsimetriaIluminacion(faceAligned);
             if (asimetria > ASIMETRIA_MAX)
             {
-                motivo = "Contraluz lateral: un lado de tu cara está más iluminado que el otro. Ubicate de frente a la luz, no de costado.";
+                motivo = MSG_LUZ_LATERAL;
                 return false;
             }
 
@@ -1243,7 +1548,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             double umbralNitidezAplicado = paraRegistro ? UMBRAL_NITIDEZ : UMBRAL_NITIDEZ_RECONOCER;
             if (nitidez < umbralNitidezAplicado)
             {
-                motivo = $"Imagen borrosa (nitidez {nitidez:F0}). Acercate y quedate quieto.";
+                motivo = MSG_QUIETO; // el valor de nitidez sigue disponible en el parámetro de salida "nitidez" para depurar
                 return false;
             }
 
@@ -1383,6 +1688,10 @@ namespace Proyecto_ReconocimientoFacial_0._1
             ultimosVotos.Clear();
             ActualizarGrilla();
 
+            // Confirmación para el usuario, al pie de la imagen (texto del Word de objetivos)
+            filtroGuia.Reiniciar();
+            EstablecerPieTemporal("Usted ha sido registrado en el sistema", COLOR_VERDE, MS_PIE_REGISTRADO);
+
             string nombre = nueva.Nombre;
             int total = listaPersonas.Count;
             string horaLocal = DateTime.Now.ToString("HH:mm:ss");
@@ -1429,7 +1738,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
         }
 
         // Muestra el fotograma sin acumular bitmaps si la interfaz va más lenta que el procesamiento
-        private void MostrarFrame(Mat frame)
+        private void MostrarFrame(Mat frame, SuperposicionFrame sp)
         {
             if (pictureBox1 == null || IsDisposed || isDisposing) return;
             if (Interlocked.Exchange(ref frameUIPendiente, 1) == 1) return; // la UI sigue ocupada: descartar este
@@ -1438,6 +1747,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             try
             {
                 frameBitmap = frame.ToBitmap();
+                DibujarSuperposicion(frameBitmap, sp); // texto y recuadro con GDI+ (Unicode)
                 Bitmap bmp = frameBitmap;
 
                 BeginInvoke(new Action(() =>
@@ -1482,6 +1792,75 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 foreach (PersonaRegistrada p in listaPersonas) p.Dispose();
                 listaPersonas.Clear();
             }
+        }
+    }
+
+    // Filtro anti-parpadeo para las indicaciones al usuario.
+    //   - APARECER: el problema debe verse ininterrumpidamente durante "retardoAparicion".
+    //   - PERMANECER: una vez visible, no se oculta ni cambia antes de "minVisible".
+    //   - DESAPARECER: el rostro debe estar bien ininterrumpidamente durante "retardoDesaparicion".
+    // Si el mensaje del fotograma oscila (mal, bien, mal, bien...), nunca se cumple una espera completa
+    // y lo mostrado no cambia: no hay parpadeo.
+    public class FiltroMensajeGuia
+    {
+        private readonly int retardoAparicionMs;
+        private readonly int retardoDesaparicionMs;
+        private readonly int minVisibleMs;
+
+        private string crudo;                       // lo que dice el fotograma actual (null = todo bien)
+        private DateTime crudoDesde = DateTime.MinValue;   // desde cuándo dice lo mismo
+        private string mostrado;                    // lo que se muestra ahora
+        private DateTime mostradoDesde = DateTime.MinValue;
+
+        public FiltroMensajeGuia(int retardoAparicionMs, int retardoDesaparicionMs, int minVisibleMs)
+        {
+            this.retardoAparicionMs = retardoAparicionMs;
+            this.retardoDesaparicionMs = retardoDesaparicionMs;
+            this.minVisibleMs = minVisibleMs;
+        }
+
+        public string Actualizar(string mensajeCrudo, DateTime ahora)
+        {
+            if (mensajeCrudo != crudo)
+            {
+                crudo = mensajeCrudo;
+                crudoDesde = ahora;
+            }
+
+            if (crudo == mostrado) return mostrado;
+
+            double estable = (ahora - crudoDesde).TotalMilliseconds;
+            double visible = (ahora - mostradoDesde).TotalMilliseconds;
+
+            if (mostrado == null)
+            {
+                // Nada visible: solo aparece si el problema persiste
+                if (estable >= retardoAparicionMs)
+                {
+                    mostrado = crudo;
+                    mostradoDesde = ahora;
+                }
+            }
+            else
+            {
+                // Hay algo visible: ocultarlo (crudo == null) o cambiarlo por otro exige más estabilidad y tiempo mínimo
+                int espera = (crudo == null) ? retardoDesaparicionMs : retardoAparicionMs;
+                if (estable >= espera && visible >= minVisibleMs)
+                {
+                    mostrado = crudo;
+                    mostradoDesde = ahora;
+                }
+            }
+
+            return mostrado;
+        }
+
+        public void Reiniciar()
+        {
+            crudo = null;
+            crudoDesde = DateTime.MinValue;
+            mostrado = null;
+            mostradoDesde = DateTime.MinValue;
         }
     }
 
