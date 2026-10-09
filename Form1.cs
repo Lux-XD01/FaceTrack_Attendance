@@ -107,7 +107,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
         // Cámara ESP32 - debe coincidir EXACTO con la IP fija que pusiste en el .ino (local_IP).
         // Si volvés a cambiar la IP fija en el firmware, actualizala también acá.
-        private readonly string ipCamara = "192.168.1.112";
+        private readonly string ipCamara = "192.168.1.107";
         private readonly string streamUrl;
         private readonly string tempUrl;
         private readonly TimeSpan intervaloTemp = TimeSpan.FromSeconds(20);

@@ -147,11 +147,15 @@ namespace Proyecto_ReconocimientoFacial_0._1
             for (int f = 0; f < 2; f++) botones.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
 
             // El orden de esta lista decide la posición (3 por fila). Cámbialo si prefieres otra disposición.
+            ConfigurarExportacion(); // crea btnGuardarComo y su menú (Form1.Exportar.cs)
+
+            // El orden de esta lista decide la posición (3 por fila). Cámbialo si prefieres otra disposición.
             Button[] ordenBotones =
             {
                 btnRegistrar, btnGuardarEdiciones, btnActualizarGrilla,
-                btnEliminarSeleccionado, btnBorrarTodo
+                btnEliminarSeleccionado, btnBorrarTodo, btnGuardarComo
             };
+
             for (int i = 0; i < ordenBotones.Length; i++)
             {
                 ordenBotones[i].Dock = DockStyle.Fill;

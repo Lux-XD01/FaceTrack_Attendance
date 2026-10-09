@@ -65,6 +65,9 @@
     <Compile Include="Form1.Diseno.cs">
       <SubType>Form</SubType>
     </Compile>
+    <Compile Include="Form1.Exportar.cs">
+      <SubType>Form</SubType>
+    </Compile>
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <EmbeddedResource Include="Form1.resx">
