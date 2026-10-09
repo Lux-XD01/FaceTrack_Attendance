@@ -225,6 +225,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
         {
             InitializeComponent();
 
+            ConstruirInterfaz(); // se encarga de enganchar eventos y aplicar estilo a los controles
+
             streamUrl = $"http://{ipCamara}:81/stream";
             tempUrl = $"http://{ipCamara}/temp";
 
