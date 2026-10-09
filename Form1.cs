@@ -522,6 +522,15 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
         private void EjecutarBusqueda()
         {
+            // Si el aviso de "no está en la base de datos" ya está en pantalla, Enter solo lo quita:
+            // la caja queda vacía, la grilla vuelve a mostrar a todos y se puede iniciar otra búsqueda.
+            // (Sin esto, el texto del aviso se tomaba como si fuera lo que se quería buscar.)
+            if (mensajeBusquedaVisible)
+            {
+                RestaurarBusqueda();
+                return;
+            }
+                      
             if (!sqlDisponible) { MostrarEstado("SQL Server no está disponible."); return; }
 
             string texto = txtBuscar.Text.Trim();
@@ -544,7 +553,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 {
                     mensajeBusquedaVisible = true;
                     txtBuscar.ForeColor = Estetica.ColorPeligro;
-                    txtBuscar.Text = $"El usuario que está buscando {texto} no está en la base de datos.";
+                    txtBuscar.Text = $"El usuario que está buscando \"{texto}\" no está en la base de datos.";
                     txtBuscar.SelectionStart = 0;   // que se vea el comienzo del aviso
                     txtBuscar.SelectionLength = 0;
                 }
@@ -762,6 +771,21 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
             string timestamp = DateTime.Now.ToString("HH:mm:ss.fff");
             textBox3.AppendText($"[{timestamp}] {mensaje}{Environment.NewLine}");
+        }
+
+        // Igual que LogMensaje, pero escribe en la pestaña LOGS (SFace) (textBox2)
+        private void LogBiometria(string mensaje)
+        {
+            if (isDisposing || IsDisposed) return;
+
+            if (InvokeRequired)
+            {
+                EjecutarEnUI(() => LogBiometria(mensaje));
+                return;
+            }
+
+            string timestamp = DateTime.Now.ToString("HH:mm:ss");
+            textBox2.AppendText($"[{timestamp}] {mensaje}{Environment.NewLine}");
         }
 
         // Estado de registro/lectura en textBox1 (con antirrebote para no saturar la UI)
@@ -1250,9 +1274,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
                 // Solo el recuadro de color; el nombre y el estado van únicamente al pie.
                 MarcarRostro(rect, null, color);
-                ActualizarMetricas(nitidezReconocimiento, data[o + 14], simPromedio);
-
-
+               
                 // Mensaje al pie de la imagen
                 if (analizando)
                 {
@@ -1270,6 +1292,12 @@ namespace Proyecto_ReconocimientoFacial_0._1
                     pieEstadoColor = COLOR_ROJO;
                 }
 
+                // Texto del estado de detección (editá "Reconocido" / "Desconocido" por lo que prefieras)
+                string estadoDeteccion = analizando
+                    ? null
+                    : (conocido ? "Reconocido" : "Desconocido");
+                ActualizarMetricas(nitidezReconocimiento, data[o + 14], simPromedio, estadoDeteccion);
+
                 if (!analizando)
                 {
                     bool esDiferenteSujeto = (identidad != ultimoSujetoNotificado);
@@ -1279,11 +1307,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                     {
                         ultimoSujetoNotificado = identidad;
                         ultimaNotificacion = DateTime.Now;
-
-                        string sujetoCopy = identidad;
-                        double simCopy = simPromedio;
-                        EjecutarEnUI(() => ActualizarInterfazLectura(sujetoCopy, simCopy));
-
+                                              
                         // Marca presente en SQL fuera del lock: la latencia de red no debe frenar el video.
                         if (sqlDisponible && conocido)
                         {
@@ -1325,7 +1349,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
         // MÉTRICAS EN VIVO
         // ------------------------------------------------------------------
         // Se llama desde el hilo de procesamiento. Un valor null significa "no disponible" y se muestra "--".
-        private void ActualizarMetricas(double? nitidez, double? confianzaYuNet, double? similitud)
+        private void ActualizarMetricas(double? nitidez, double? confianzaYuNet, double? similitud, string estadoDeteccion = null)
         {
             DateTime ahora = DateTime.Now;
             if ((ahora - ultimaActualizacionMetricas).TotalMilliseconds < MS_ENTRE_METRICAS) return;
@@ -1335,15 +1359,20 @@ namespace Proyecto_ReconocimientoFacial_0._1
             string sConfianza = confianzaYuNet.HasValue ? (confianzaYuNet.Value * 100.0).ToString("F0") + "%" : "--";
             string sSimilitud = similitud.HasValue ? similitud.Value.ToString("F2") : "--";
 
+            // Si no hay respuesta/detección o es null/vacío, se muestran las dos líneas "--"
+            string sDeteccion = string.IsNullOrEmpty(estadoDeteccion) ? "--" : estadoDeteccion;
+
             string texto =
                 "MÉTRICAS EN VIVO:" + Environment.NewLine +
                 "--------------" + Environment.NewLine +
                 $"NITIDEZ (Fija: >{UMBRAL_NITIDEZ_RECONOCER:F0}):  {sNitidez}" + Environment.NewLine +
                 $"CONFIDENCIA (YuNet):  {sConfianza}" + Environment.NewLine +
-                $"SIMILITUD (Fija: >{UMBRAL_SFACE:F2}):  {sSimilitud}";
+                $"SIMILITUD (Fija: >{UMBRAL_SFACE:F2}):  {sSimilitud}" + Environment.NewLine +
+                $"DETECCION:  {sDeteccion}";
 
             EjecutarEnUI(() => textBox1.Text = texto);
         }
+
         // Elige qué mensaje va al pie. Prioridad: 1) mensaje temporal (ej. "Usted ha sido registrado"),
         // 2) indicación de posicionamiento ya filtrada (sin parpadeo), 3) estado normal (presente, etc.).
         private void ComponerPie()
@@ -1537,7 +1566,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             muestrasRegistro.Add(copia);
             ultimaMuestra = DateTime.Now;
 
-            LogMensaje($"[REGISTRO] Muestra {muestrasRegistro.Count}/{MUESTRAS_REGISTRO} (nitidez {nitidez:F0}, score {data[o + 14]:F2})");
+            LogBiometria($"[REGISTRO] Muestra {muestrasRegistro.Count}/{MUESTRAS_REGISTRO} (nitidez {nitidez:F0}, score {data[o + 14]:F2})");
             MostrarEstado($"Registrando... {muestrasRegistro.Count}/{MUESTRAS_REGISTRO}");
 
             if (muestrasRegistro.Count >= MUESTRAS_REGISTRO) FinalizarRegistro();
@@ -1754,7 +1783,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 }
                 catch (Exception ex)
                 {
-                    LogMensaje($"[AVISO] No se pudo guardar en SQL Server: {ex.Message}");
+                    LogBiometria($"[AVISO] No se pudo guardar en SQL Server: {ex.Message}");
                 }
             }
 
@@ -1809,19 +1838,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
         // ------------------------------------------------------------------
         // INTERFAZ
         // ------------------------------------------------------------------
-        private void ActualizarInterfazLectura(string sujeto, double similitud)
-        {
-            if (isDisposing || IsDisposed) return;
-
-            string horaLocal = DateTime.Now.ToString("HH:mm:ss");
-
-            if (sujeto != "Desconocido")
-                textBox2.AppendText($"[{horaLocal}] ACCESO CONCEDIDO: {sujeto} (Similitud: {similitud:F2}){Environment.NewLine}");
-            else
-                textBox2.AppendText($"[{horaLocal}] ACCESO DENEGADO: DESCONOCIDO (Similitud: {similitud:F2}){Environment.NewLine}");
-        
-        }
-
+       
         // Muestra el fotograma sin acumular bitmaps si la interfaz va más lenta que el procesamiento
         private void MostrarFrame(Mat frame, SuperposicionFrame sp)
         {
