@@ -73,6 +73,10 @@ namespace Proyecto_ReconocimientoFacial_0._1
         private const double BRILLO_MIN = 50.0;           // Media de gris (0-255) mínima: por debajo, a contraluz
         private const double BRILLO_MAX = 210.0;          // Media de gris (0-255) máxima: por encima, luz directa
         private const double ASIMETRIA_MAX = 45.0;        // Diferencia de brillo izq/der máxima: por encima, contraluz lateral
+        private const double ASIMETRIA_VERTICAL_MAX = 20.0; // brillo(boca/mentón) − brillo(frente/ojos): por encima = luz desde abajo
+        private const double BRILLO_SOBREEXPUESTO = 175.0;  // rostro borroso + brillo >= esto -> se culpa a la luz
+        private const double BRILLO_SUBEXPUESTO = 70.0;     // rostro borroso + brillo <= esto -> se culpa a la luz
+        private const int LADO_COMODO_RECONOCER = 80;       // rostro más chico + borroso = está lejos, no movido (px)
         private const float UMBRAL_CONSISTENCIA = 0.40f;  // Las muestras del registro deben parecerse a la primera
         private const int MUESTRAS_REGISTRO = 5;          // Muestras por persona
         private const int MS_ENTRE_MUESTRAS = 300;        // Separación entre muestras
@@ -93,17 +97,21 @@ namespace Proyecto_ReconocimientoFacial_0._1
         private const int RETARDO_DESAPARICION_GUIA_MS = 700;  // el rostro debe estar bien este tiempo para ocultarla
         private const int MIN_VISIBLE_GUIA_MS = 1200;          // una vez mostrada, se queda al menos esto
         private const int MS_PIE_REGISTRADO = 4000;            // duración de "Usted ha sido registrado en el sistema"
+        private const int RETARDO_CAMBIO_ESTADO_MS = 400;  // un estado nuevo debe persistir esto para mostrarse
+        private const int RETARDO_VACIAR_ESTADO_MS = 900;  // sin estado (rostro perdido) esto para ocultar la banda
+        private const int MIN_VISIBLE_ESTADO_MS = 1000;    // un estado mostrado se queda al menos esto
+        private const int VOTOS_PARA_CAMBIAR = 5;          // de 7: votos para sacar una identidad ya confirmada
 
         // Textos de indicación para el usuario (forma "usted", como en el Word de objetivos)
-        private const string MSG_ACERCARSE = "Acérquese a la cámara";
-        private const string MSG_ALEJARSE = "Aléjese de la cámara";
-        private const string MSG_CENTRO = "Póngase en el centro";
-        private const string MSG_QUIETO = "Manténgase quieto";
-        private const string MSG_DE_FRENTE = "Mire de frente a la cámara";
-        private const string MSG_NIVELAR = "Mantenga la cabeza derecha";
-        private const string MSG_POCA_LUZ = "Falta luz: ilumine su rostro de frente";
-        private const string MSG_MUCHA_LUZ = "Demasiada luz directa sobre su rostro";
-        private const string MSG_LUZ_LATERAL = "Luz de costado: póngase de frente a la luz";
+        private const string MSG_ACERCARSE = "Acérquese a la cámara";                 //funciona
+        private const string MSG_ALEJARSE = "Aléjese de la cámara";                   //funciona
+        private const string MSG_CENTRO = "Póngase en el centro";                     //funciona, si estas en los margenes salta.
+        private const string MSG_QUIETO = "Manténgase quieto";                        //en PRUEBA
+        private const string MSG_DE_FRENTE = "Mire de frente a la cámara";            //funciona
+        private const string MSG_NIVELAR = "Mantenga la cabeza derecha";              //funciona
+        private const string MSG_POCA_LUZ = "Falta luz: ilumine su rostro de frente"; //funciona
+        private const string MSG_MUCHA_LUZ = "Demasiada luz directa sobre su rostro"; // en PRUEBA
+        private const string MSG_LUZ_LATERAL = "Luz de costado: póngase de frente a la luz"; //funciona
 
         // Cámara ESP32 - debe coincidir EXACTO con la IP fija que pusiste en el .ino (local_IP).
         // Si volvés a cambiar la IP fija en el firmware, actualizala también acá.
@@ -167,6 +175,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
         private CancellationTokenSource cancellationTokenSource;
         private Size ultimoTamanoDeteccion = Size.Empty;
+        private Size ultimaResolucionLog = Size.Empty;
+
         private int frameUIPendiente = 0; // 1 = la interfaz aún no terminó de pintar el fotograma anterior
         private bool formCargado = false;
 
@@ -211,6 +221,13 @@ namespace Proyecto_ReconocimientoFacial_0._1
         private DateTime pieTemporalHasta = DateTime.MinValue;
         private readonly FiltroMensajeGuia filtroGuia =
             new FiltroMensajeGuia(RETARDO_APARICION_GUIA_MS, RETARDO_DESAPARICION_GUIA_MS, MIN_VISIBLE_GUIA_MS);
+
+        private readonly FiltroEstadoPie filtroEstado =
+    new FiltroEstadoPie(RETARDO_CAMBIO_ESTADO_MS, RETARDO_VACIAR_ESTADO_MS, MIN_VISIBLE_ESTADO_MS);
+        private bool pieEstadoSinFiltro;          // true durante el registro: el contador debe verse al instante
+        private string identidadConfirmada = null;
+        private readonly bool depurarLuz = true;  // pon false cuando termines de calibrar
+        private DateTime ultimoLogLuz = DateTime.MinValue;
 
         // Historial de temperatura para el gráfico (reemplaza el log de texto repetitivo)
         private readonly object lockHistorialTemp = new object();
@@ -1017,7 +1034,15 @@ namespace Proyecto_ReconocimientoFacial_0._1
                     using (Mat frame = new Mat())
                     {
                         CvInvoke.Imdecode(jpeg, ImreadModes.Color, frame);
-                        if (!frame.IsEmpty) ProcessFrame(frame);
+                        if (!frame.IsEmpty)
+                        {
+                            if (frame.Size != ultimaResolucionLog)
+                            {
+                                ultimaResolucionLog = frame.Size;
+                                LogMensaje($"[CÁMARA] Recibiendo {frame.Width}x{frame.Height} px | JPEG de {jpeg.Length / 1024} KB");
+                            }
+                            ProcessFrame(frame);
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -1068,6 +1093,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             superposicion = new SuperposicionFrame();
             guiaCruda = null;
             pieEstadoTexto = null;
+            pieEstadoSinFiltro = false;
 
             try
             {
@@ -1219,6 +1245,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                         ActualizarMetricas(null, data[o + 14], null);
                         pieEstadoTexto = $"Registrando... {muestrasRegistro.Count}/{MUESTRAS_REGISTRO}. {MSG_QUIETO}";
                         pieEstadoColor = COLOR_AZUL;
+                        pieEstadoSinFiltro = true;
                     }
                     return;
                 }
@@ -1373,30 +1400,41 @@ namespace Proyecto_ReconocimientoFacial_0._1
             EjecutarEnUI(() => textBox1.Text = texto);
         }
 
-        // Elige qué mensaje va al pie. Prioridad: 1) mensaje temporal (ej. "Usted ha sido registrado"),
-        // 2) indicación de posicionamiento ya filtrada (sin parpadeo), 3) estado normal (presente, etc.).
         private void ComponerPie()
         {
             DateTime ahora = DateTime.Now;
 
-            // Se actualiza SIEMPRE (aunque haya un temporal) para que los tiempos del filtro sigan corriendo.
+            // Los dos filtros corren SIEMPRE (aunque haya un temporal) para que sus tiempos sigan avanzando.
             string guia = filtroGuia.Actualizar(guiaCruda, ahora);
 
-            if (pieTemporalTexto != null && ahora < pieTemporalHasta)
+            string textoEstado;
+            Color colorEstado;
+            if (pieEstadoSinFiltro)
             {
-                superposicion.Pie = pieTemporalTexto;
-                superposicion.ColorPie = pieTemporalColor;
+                // Durante el registro el contador "Registrando... n/5" debe verse al instante
+                textoEstado = pieEstadoTexto;
+                colorEstado = pieEstadoColor;
+                filtroEstado.Reiniciar();
             }
-            else if (guia != null)
+            else
             {
-                superposicion.Pie = guia;
-                superposicion.ColorPie = COLOR_AMARILLO;
+                filtroEstado.Actualizar(pieEstadoTexto, pieEstadoColor, ahora, out textoEstado, out colorEstado);
             }
-            else if (pieEstadoTexto != null)
-            {
-                superposicion.Pie = pieEstadoTexto;
-                superposicion.ColorPie = pieEstadoColor;
-            }
+
+            string texto = null;
+            Color color = Color.Empty;
+
+            if (pieTemporalTexto != null && ahora < pieTemporalHasta) { texto = pieTemporalTexto; color = pieTemporalColor; }
+            else if (guia != null) { texto = guia; color = COLOR_AMARILLO; }
+            else if (textoEstado != null) { texto = textoEstado; color = colorEstado; }
+
+            if (texto == null) return;
+
+            superposicion.Pie = texto;
+            superposicion.ColorPie = color;
+
+            // El recuadro toma el color del mensaje YA filtrado: ambos cambian a la vez y nunca se contradicen.
+            if (superposicion.Rostro != null) superposicion.Rostro.Color = color;
         }
 
         private void EstablecerPieTemporal(string texto, Color color, int milisegundos)
@@ -1465,18 +1503,36 @@ namespace Proyecto_ReconocimientoFacial_0._1
         }
 
         // Votación sobre los últimos fotogramas: elimina el "parpadeo" de identidades por ruido del stream
+
         private string ConfirmarIdentidad(string candidato, double similitud, out double simPromedio)
         {
+            // Cola vacía (se vació al irse la persona, al borrar, etc.): se empieza de cero.
+            if (ultimosVotos.Count == 0) identidadConfirmada = null;
+
             ultimosVotos.Enqueue(new KeyValuePair<string, double>(candidato, similitud));
             while (ultimosVotos.Count > VENTANA_VOTOS) ultimosVotos.Dequeue();
 
             var ganador = ultimosVotos.GroupBy(v => v.Key).OrderByDescending(g => g.Count()).First();
+
+            bool hayGanador = ultimosVotos.Count >= VOTOS_MINIMOS && ganador.Count() >= VOTOS_MINIMOS;
+            if (hayGanador)
+            {
+                // Una identidad ya confirmada solo se cambia con VOTOS_PARA_CAMBIAR de 7 (evita el rojo/verde alternando)
+                bool puedeCambiar = identidadConfirmada == null
+                                 || ganador.Key == identidadConfirmada
+                                 || ganador.Count() >= VOTOS_PARA_CAMBIAR;
+                if (puedeCambiar) identidadConfirmada = ganador.Key;
+            }
+
+            if (identidadConfirmada != null)
+            {
+                var votosDeEsa = ultimosVotos.Where(v => v.Key == identidadConfirmada).ToList();
+                simPromedio = votosDeEsa.Count > 0 ? votosDeEsa.Average(v => v.Value) : ganador.Average(v => v.Value);
+                return identidadConfirmada;
+            }
+
             simPromedio = ganador.Average(v => v.Value);
-
-            if (ultimosVotos.Count < VOTOS_MINIMOS || ganador.Count() < VOTOS_MINIMOS)
-                return candidato == ESTADO_AMBIGUO ? ESTADO_AMBIGUO : ESTADO_ANALIZANDO;
-
-            return ganador.Key;
+            return candidato == ESTADO_AMBIGUO ? ESTADO_AMBIGUO : ESTADO_ANALIZANDO;
         }
 
         private void ResetearEstadoSiNoHayRostro()
@@ -1578,8 +1634,10 @@ namespace Proyecto_ReconocimientoFacial_0._1
         // Ahora la misma función sirve para los dos modos: "paraRegistro" decide qué tan exigentes son
         // el score mínimo, el tamaño mínimo y la nitidez mínima (el registro siempre es más estricto
         // que el reconocimiento, porque de ahí sale la plantilla que se usa para comparar todo después).
+
+
         private bool EsRostroValido(Size frameSize, float[] data, int o, Mat faceAligned, bool paraRegistro,
-                                    out string motivo, out double nitidez)
+                            out string motivo, out double nitidez)
         {
             motivo = "";
             nitidez = 0;
@@ -1590,30 +1648,32 @@ namespace Proyecto_ReconocimientoFacial_0._1
             float h = data[o + 3];
             float score = data[o + 14];
 
-            // En reconocimiento se usa el umbral de SALIDA: el de ENTRADA ya se exigió en SeleccionarRostroPrincipal.
             float scoreMinimo = paraRegistro ? SCORE_REGISTRO : SCORE_DETECCION_SALIDA;
             int ladoMinimo = paraRegistro ? MIN_LADO_REGISTRO : MIN_LADO_RECONOCER;
 
-            if (score < scoreMinimo)
-            {
-                motivo = MSG_DE_FRENTE;
-                return false;
-            }
+            // 1) DISTANCIA: lo primero, porque un rostro chico degrada todo lo demás
+            if (w < ladoMinimo || h < ladoMinimo) { motivo = MSG_ACERCARSE; return false; }
 
-            if (w < ladoMinimo || h < ladoMinimo)
-            {
-                motivo = MSG_ACERCARSE;
-                return false;
-            }
-
+            // 2) ENCUADRE
             if (x < MARGEN_BORDE || y < MARGEN_BORDE ||
                 x + w > frameSize.Width - MARGEN_BORDE || y + h > frameSize.Height - MARGEN_BORDE)
             {
-                // Rostro cortado por el borde: si es grande, está demasiado cerca; si es chico, está corrido.
                 bool demasiadoCerca = Math.Max(w / frameSize.Width, h / frameSize.Height) > FRACCION_ROSTRO_DEMASIADO_CERCA;
                 motivo = demasiadoCerca ? MSG_ALEJARSE : MSG_CENTRO;
                 return false;
             }
+
+            // 3) LUZ: antes que la pose, porque la mala luz es la que desvía los landmarks
+            DatosLuz luz = AnalizarIluminacion(faceAligned);
+            if (depurarLuz) LogLuz(luz, w);
+
+            if (luz.Brillo < BRILLO_MIN) { motivo = MSG_POCA_LUZ; return false; }
+            if (luz.Brillo > BRILLO_MAX) { motivo = MSG_MUCHA_LUZ; return false; }
+            if (luz.AsimLateral > ASIMETRIA_MAX) { motivo = MSG_LUZ_LATERAL; return false; }
+            if (luz.AsimVertical > ASIMETRIA_VERTICAL_MAX) { motivo = MSG_POCA_LUZ; return false; } // luz desde abajo
+
+            // 4) POSE
+            if (score < scoreMinimo) { motivo = MSG_DE_FRENTE; return false; }
 
             PointF ojoDerecho = new PointF(data[o + 4], data[o + 5]);
             PointF ojoIzquierdo = new PointF(data[o + 6], data[o + 7]);
@@ -1622,51 +1682,28 @@ namespace Proyecto_ReconocimientoFacial_0._1
             double deltaY = ojoIzquierdo.Y - ojoDerecho.Y;
             double deltaX = ojoIzquierdo.X - ojoDerecho.X;
             double anguloRoll = Math.Abs(Math.Atan2(deltaY, deltaX) * (180.0 / Math.PI));
+            if (anguloRoll > 12.0) { motivo = MSG_NIVELAR; return false; }
 
-            if (anguloRoll > 12.0)
-            {
-                motivo = MSG_NIVELAR;
-                return false;
-            }
-
-            // Esta es la relación que detecta PERFIL: con la cara de frente, la nariz queda a mitad
-            // de camino entre los dos ojos (relación cercana a 1.0). Girando la cabeza hacia un
-            // costado, la nariz se acerca a uno de los ojos y se aleja del otro, y la relación se
-            // dispara para arriba o para abajo. Fuera de [0.6, 1.67] ya se considera perfil, no frente.
             double distOjoDerNariz = Math.Abs(nariz.X - ojoDerecho.X);
             double distOjoIzqNariz = Math.Abs(ojoIzquierdo.X - nariz.X);
             double relacionYaw = distOjoDerNariz / (distOjoIzqNariz + 1e-5);
+            if (relacionYaw < UMBRAL_YAW_MIN || relacionYaw > UMBRAL_YAW_MAX) { motivo = MSG_DE_FRENTE; return false; }
 
-            if (relacionYaw < UMBRAL_YAW_MIN || relacionYaw > UMBRAL_YAW_MAX)
-            {
-                motivo = MSG_DE_FRENTE;
-                return false;
-            }
-
-            double brillo = CalcularBrillo(faceAligned);
-            if (brillo < BRILLO_MIN || brillo > BRILLO_MAX)
-            {
-                motivo = brillo < BRILLO_MIN ? MSG_POCA_LUZ : MSG_MUCHA_LUZ;
-                return false;
-            }
-
-            double asimetria = CalcularAsimetriaIluminacion(faceAligned);
-            if (asimetria > ASIMETRIA_MAX)
-            {
-                motivo = MSG_LUZ_LATERAL;
-                return false;
-            }
-
+            // 5) NITIDEZ: antes de decir "quieto" se descartan las otras causas de una imagen blanda
             nitidez = CalcularNitidez(faceAligned);
             double umbralNitidezAplicado = paraRegistro ? UMBRAL_NITIDEZ : UMBRAL_NITIDEZ_RECONOCER;
             if (nitidez < umbralNitidezAplicado)
             {
-                motivo = MSG_QUIETO; // el valor de nitidez sigue disponible en el parámetro de salida "nitidez" para depurar
+                if (luz.Brillo >= BRILLO_SOBREEXPUESTO) motivo = MSG_MUCHA_LUZ;
+                else if (luz.Brillo <= BRILLO_SUBEXPUESTO) motivo = MSG_POCA_LUZ;
+                else if (w < LADO_COMODO_RECONOCER || h < LADO_COMODO_RECONOCER) motivo = MSG_ACERCARSE;
+                else motivo = MSG_QUIETO;
                 return false;
             }
 
             return true;
         }
+
 
         // Varianza del Laplaciano sobre el rostro alineado (112x112): mide el enfoque/movimiento
         private double CalcularNitidez(Mat faceAligned)
@@ -1684,35 +1721,43 @@ namespace Proyecto_ReconocimientoFacial_0._1
             }
         }
 
-        // Media de gris del rostro alineado: valores bajos = a contraluz/oscuro, altos = luz directa
-        private double CalcularBrillo(Mat faceAligned)
+        private struct DatosLuz
+        {
+            public double Brillo;        // media de gris de todo el recorte
+            public double AsimLateral;   // |izquierda − derecha|
+            public double AsimVertical;  // brillo(zona boca/mentón) − brillo(zona frente/ojos)
+        }
+
+        private DatosLuz AnalizarIluminacion(Mat faceAligned)
         {
             using (Mat gris = new Mat())
             {
                 CvInvoke.CvtColor(faceAligned, gris, ColorConversion.Bgr2Gray);
-                return CvInvoke.Mean(gris).V0;
+
+                int ancho = gris.Cols, alto = gris.Rows;
+                double Media(Rectangle r) { using (Mat roi = new Mat(gris, r)) return CvInvoke.Mean(roi).V0; }
+
+                int mitad = ancho / 2;
+                int x0 = (int)(ancho * 0.18), x1 = (int)(ancho * 0.82); // sin los bordes (pelo / fondo)
+
+                Rectangle bandaFrente = new Rectangle(x0, (int)(alto * 0.22), x1 - x0, (int)(alto * 0.26));
+                Rectangle bandaBoca = new Rectangle(x0, (int)(alto * 0.66), x1 - x0, (int)(alto * 0.26));
+
+                DatosLuz d = new DatosLuz();
+                d.Brillo = CvInvoke.Mean(gris).V0;
+                d.AsimLateral = Math.Abs(Media(new Rectangle(0, 0, mitad, alto)) -
+                                         Media(new Rectangle(mitad, 0, ancho - mitad, alto)));
+                d.AsimVertical = Media(bandaBoca) - Media(bandaFrente);
+                return d;
             }
         }
 
-        // Diferencia de brillo entre la mitad izquierda y derecha del rostro. CalcularBrillo() solo
-        // detecta cuando TODA la cara está muy oscura o muy clara en promedio; no detecta el caso típico
-        // de contraluz lateral (una ventana de un lado) donde el promedio general puede parecer normal
-        // pero un lado de la cara está quemado de luz y el otro en sombra, degradando igual el vector.
-        private double CalcularAsimetriaIluminacion(Mat faceAligned)
+        // Para calibrar: una línea por segundo en la pestaña "LOGS (SFace)" con los valores reales.
+        private void LogLuz(DatosLuz d, float anchoRostro)
         {
-            using (Mat gris = new Mat())
-            {
-                CvInvoke.CvtColor(faceAligned, gris, ColorConversion.Bgr2Gray);
-                int mitad = gris.Cols / 2;
-
-                using (Mat izquierda = new Mat(gris, new Rectangle(0, 0, mitad, gris.Rows)))
-                using (Mat derecha = new Mat(gris, new Rectangle(mitad, 0, gris.Cols - mitad, gris.Rows)))
-                {
-                    double brilloIzq = CvInvoke.Mean(izquierda).V0;
-                    double brilloDer = CvInvoke.Mean(derecha).V0;
-                    return Math.Abs(brilloIzq - brilloDer);
-                }
-            }
+            if ((DateTime.Now - ultimoLogLuz).TotalMilliseconds < 1000) return;
+            ultimoLogLuz = DateTime.Now;
+            LogBiometria($"[LUZ] brillo {d.Brillo:F0} | lateral {d.AsimLateral:F0} | vertical {d.AsimVertical:F0} | ancho rostro {anchoRostro:F0} px");
         }
 
         // Promedio normalizado de varias muestras: una sola plantilla por persona en vez de 5 vectores sueltos
@@ -1964,6 +2009,31 @@ namespace Proyecto_ReconocimientoFacial_0._1
             mostrado = null;
             mostradoDesde = DateTime.MinValue;
         }
+    }
+
+    // Igual que FiltroMensajeGuia, pero para el ESTADO normal del pie (texto + color).
+    // Evita que "X está presente" / "Desconocido" / "Analizando" cambien a cada fotograma.
+    public class FiltroEstadoPie
+    {
+        private readonly FiltroMensajeGuia filtro;
+
+        public FiltroEstadoPie(int retardoCambioMs, int retardoVaciarMs, int minVisibleMs)
+        {
+            filtro = new FiltroMensajeGuia(retardoCambioMs, retardoVaciarMs, minVisibleMs);
+        }
+
+        public void Actualizar(string texto, Color color, DateTime ahora, out string textoMostrado, out Color colorMostrado)
+        {
+            string clave = (texto == null) ? null : color.ToArgb().ToString("X8") + "|" + texto;
+            string r = filtro.Actualizar(clave, ahora);
+
+            if (r == null) { textoMostrado = null; colorMostrado = Color.Empty; return; }
+
+            colorMostrado = Color.FromArgb(Convert.ToInt32(r.Substring(0, 8), 16));
+            textoMostrado = r.Substring(9);
+        }
+
+        public void Reiniciar() { filtro.Reiniciar(); }
     }
 
     public class PersonaRegistrada : IDisposable
