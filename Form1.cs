@@ -71,10 +71,10 @@ namespace Proyecto_ReconocimientoFacial_0._1
         private const double UMBRAL_YAW_MIN = 0.6;            // Relación ojo-nariz mínima: por debajo, está de perfil
         private const double UMBRAL_YAW_MAX = 1.67;           // Relación ojo-nariz máxima: por encima, está de perfil (al otro lado)
         private const double BRILLO_MIN = 50.0;           // Media de gris (0-255) mínima: por debajo, a contraluz
-        private const double BRILLO_MAX = 210.0;          // Media de gris (0-255) máxima: por encima, luz directa
-        private const double ASIMETRIA_MAX = 45.0;        // Diferencia de brillo izq/der máxima: por encima, contraluz lateral
-        private const double ASIMETRIA_VERTICAL_MAX = 20.0; // brillo(boca/mentón) − brillo(frente/ojos): por encima = luz desde abajo
-        private const double BRILLO_SOBREEXPUESTO = 175.0;  // rostro borroso + brillo >= esto -> se culpa a la luz
+        private const double BRILLO_MAX = 155.0;          // Media de gris (0-255) máxima: por encima, luz directa
+        private const double ASIMETRIA_MAX = 30.0;        // Diferencia de brillo izq/der máxima: por encima, contraluz lateral
+        private const double ASIMETRIA_VERTICAL_MAX = 40.0; // brillo(boca/mentón) − brillo(frente/ojos): por encima = luz desde abajo
+        private const double BRILLO_SOBREEXPUESTO = 140.0;  // rostro borroso + brillo >= esto -> se culpa a la luz
         private const double BRILLO_SUBEXPUESTO = 70.0;     // rostro borroso + brillo <= esto -> se culpa a la luz
         private const int LADO_COMODO_RECONOCER = 80;       // rostro más chico + borroso = está lejos, no movido (px)
         private const float UMBRAL_CONSISTENCIA = 0.40f;  // Las muestras del registro deben parecerse a la primera
@@ -101,16 +101,17 @@ namespace Proyecto_ReconocimientoFacial_0._1
         private const int RETARDO_VACIAR_ESTADO_MS = 900;  // sin estado (rostro perdido) esto para ocultar la banda
         private const int MIN_VISIBLE_ESTADO_MS = 1000;    // un estado mostrado se queda al menos esto
         private const int VOTOS_PARA_CAMBIAR = 5;          // de 7: votos para sacar una identidad ya confirmada
+        private const double UMBRAL_MOVIMIENTO = 0.6;      // velocidad del rostro en "anchos de rostro por segundo" (suavizada)
 
         // Textos de indicación para el usuario (forma "usted", como en el Word de objetivos)
         private const string MSG_ACERCARSE = "Acérquese a la cámara";                 //funciona
         private const string MSG_ALEJARSE = "Aléjese de la cámara";                   //funciona
         private const string MSG_CENTRO = "Póngase en el centro";                     //funciona, si estas en los margenes salta.
-        private const string MSG_QUIETO = "Manténgase quieto";                        //en PRUEBA
+        private const string MSG_QUIETO = "Manténgase quieto";                        //funciona
         private const string MSG_DE_FRENTE = "Mire de frente a la cámara";            //funciona
         private const string MSG_NIVELAR = "Mantenga la cabeza derecha";              //funciona
         private const string MSG_POCA_LUZ = "Falta luz: ilumine su rostro de frente"; //funciona
-        private const string MSG_MUCHA_LUZ = "Demasiada luz directa sobre su rostro"; // en PRUEBA
+        private const string MSG_MUCHA_LUZ = "Demasiada luz directa sobre su rostro"; //funciona
         private const string MSG_LUZ_LATERAL = "Luz de costado: póngase de frente a la luz"; //funciona
 
         // Cámara ESP32 - debe coincidir EXACTO con la IP fija que pusiste en el .ino (local_IP).
@@ -226,8 +227,12 @@ namespace Proyecto_ReconocimientoFacial_0._1
     new FiltroEstadoPie(RETARDO_CAMBIO_ESTADO_MS, RETARDO_VACIAR_ESTADO_MS, MIN_VISIBLE_ESTADO_MS);
         private bool pieEstadoSinFiltro;          // true durante el registro: el contador debe verse al instante
         private string identidadConfirmada = null;
-        private readonly bool depurarLuz = true;  // pon false cuando termines de calibrar
+        private readonly bool depurarLuz = false;  // pon false cuando termines de calibrar
         private DateTime ultimoLogLuz = DateTime.MinValue;
+        private PointF centroAnterior = PointF.Empty;
+        private DateTime centroAnteriorTs = DateTime.MinValue;
+        private double velocidadSuavizada = 0;
+        private DateTime ultimoLogMov = DateTime.MinValue;
 
         // Historial de temperatura para el gráfico (reemplaza el log de texto repetitivo)
         private readonly object lockHistorialTemp = new object();
@@ -1220,6 +1225,17 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 return;
             }
 
+            // Movimiento: si el rostro se desplaza rápido, se pide quietud antes de intentar reconocer o registrar
+            double velocidad = VelocidadRostro(rect);
+            LogMovimiento(velocidad);
+            if (velocidad > UMBRAL_MOVIMIENTO)
+            {
+                MarcarRostro(rect, null, COLOR_AMARILLO);
+                guiaCruda = MSG_QUIETO;
+                ActualizarMetricas(null, data[o + 14], null);
+                return;
+            }
+
             // Fila de detección en coordenadas ya corregidas (data puede venir reescalado desde ProcessFrame)
             float[] filaValores = new float[cols];
             Array.Copy(data, o, filaValores, 0, cols);
@@ -1663,14 +1679,17 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 return false;
             }
 
+            // La nitidez se mide acá (se usa al final y también queda en el log para calibrar)
+            nitidez = CalcularNitidez(faceAligned);
+
             // 3) LUZ: antes que la pose, porque la mala luz es la que desvía los landmarks
             DatosLuz luz = AnalizarIluminacion(faceAligned);
-            if (depurarLuz) LogLuz(luz, w);
+            if (depurarLuz) LogLuz(luz, w, nitidez);
 
             if (luz.Brillo < BRILLO_MIN) { motivo = MSG_POCA_LUZ; return false; }
             if (luz.Brillo > BRILLO_MAX) { motivo = MSG_MUCHA_LUZ; return false; }
-            if (luz.AsimLateral > ASIMETRIA_MAX) { motivo = MSG_LUZ_LATERAL; return false; }
             if (luz.AsimVertical > ASIMETRIA_VERTICAL_MAX) { motivo = MSG_POCA_LUZ; return false; } // luz desde abajo
+            if (luz.AsimLateral > ASIMETRIA_MAX) { motivo = MSG_LUZ_LATERAL; return false; }
 
             // 4) POSE
             if (score < scoreMinimo) { motivo = MSG_DE_FRENTE; return false; }
@@ -1690,7 +1709,6 @@ namespace Proyecto_ReconocimientoFacial_0._1
             if (relacionYaw < UMBRAL_YAW_MIN || relacionYaw > UMBRAL_YAW_MAX) { motivo = MSG_DE_FRENTE; return false; }
 
             // 5) NITIDEZ: antes de decir "quieto" se descartan las otras causas de una imagen blanda
-            nitidez = CalcularNitidez(faceAligned);
             double umbralNitidezAplicado = paraRegistro ? UMBRAL_NITIDEZ : UMBRAL_NITIDEZ_RECONOCER;
             if (nitidez < umbralNitidezAplicado)
             {
@@ -1703,7 +1721,6 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
             return true;
         }
-
 
         // Varianza del Laplaciano sobre el rostro alineado (112x112): mide el enfoque/movimiento
         private double CalcularNitidez(Mat faceAligned)
@@ -1719,6 +1736,31 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 CvInvoke.MeanStdDev(laplaciano, ref media, ref desviacion);
                 return desviacion.V0 * desviacion.V0;
             }
+        }
+
+        // Velocidad del rostro en "anchos de rostro por segundo": no depende de qué tan lejos estés de la cámara.
+        // Se suaviza para que un salto aislado del detector no dispare el mensaje.
+        private double VelocidadRostro(Rectangle rect)
+        {
+            DateTime ahora = DateTime.Now;
+            PointF centro = new PointF(rect.X + rect.Width / 2f, rect.Y + rect.Height / 2f);
+            double dt = (ahora - centroAnteriorTs).TotalSeconds;
+
+            if (centroAnteriorTs == DateTime.MinValue || dt >= 0.5)
+            {
+                velocidadSuavizada = 0; // primer fotograma o rostro recién reaparecido: no hay referencia
+            }
+            else if (dt > 0.01)
+            {
+                double dx = centro.X - centroAnterior.X;
+                double dy = centro.Y - centroAnterior.Y;
+                double instantanea = Math.Sqrt(dx * dx + dy * dy) / dt / Math.Max(1, rect.Width);
+                velocidadSuavizada = 0.6 * velocidadSuavizada + 0.4 * instantanea;
+            }
+
+            centroAnterior = centro;
+            centroAnteriorTs = ahora;
+            return velocidadSuavizada;
         }
 
         private struct DatosLuz
@@ -1752,12 +1794,20 @@ namespace Proyecto_ReconocimientoFacial_0._1
             }
         }
 
-        // Para calibrar: una línea por segundo en la pestaña "LOGS (SFace)" con los valores reales.
-        private void LogLuz(DatosLuz d, float anchoRostro)
+        // Para calibrar: líneas en la pestaña "LOGS (SFace)" con los valores reales.
+        private void LogLuz(DatosLuz d, float anchoRostro, double nitidez)
         {
             if ((DateTime.Now - ultimoLogLuz).TotalMilliseconds < 1000) return;
             ultimoLogLuz = DateTime.Now;
-            LogBiometria($"[LUZ] brillo {d.Brillo:F0} | lateral {d.AsimLateral:F0} | vertical {d.AsimVertical:F0} | ancho rostro {anchoRostro:F0} px");
+            LogBiometria($"[LUZ] brillo {d.Brillo:F0} | lateral {d.AsimLateral:F0} | vertical {d.AsimVertical:F0} | nitidez {nitidez:F0} | ancho rostro {anchoRostro:F0} px");
+        }
+
+        private void LogMovimiento(double velocidad)
+        {
+            if (!depurarLuz) return;
+            if ((DateTime.Now - ultimoLogMov).TotalMilliseconds < 400) return;
+            ultimoLogMov = DateTime.Now;
+            LogBiometria($"[MOV] velocidad {velocidad:F2} (umbral {UMBRAL_MOVIMIENTO:F2})");
         }
 
         // Promedio normalizado de varias muestras: una sola plantilla por persona en vez de 5 vectores sueltos
