@@ -40,11 +40,8 @@ using System.Data;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
-using System.IO;
-using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -87,7 +84,6 @@ namespace Proyecto_ReconocimientoFacial_0._1
         private const int MS_TIMEOUT_REGISTRO = 10000;    // Tiempo máximo para completar un registro
         private const int VENTANA_VOTOS = 7;              // Fotogramas usados para confirmar identidad
         private const int VOTOS_MINIMOS = 4;              // Coincidencias necesarias dentro de la ventana
-        private const int MAX_PERSONAS = 4;
         private const int ESCALA_MAX_DETECCION = 640;     // Lado máximo (px) para correr YuNet; frames mayores se reducen
         private const string ESTADO_ANALIZANDO = "Analizando...";
         private const string ESTADO_AMBIGUO = "Verificando...";
@@ -341,6 +337,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             }
 
             InicializarSql();
+            LogEstadoMemoria();
 
             // El ping es solo informativo y no bloquea la interfaz ni impide conectar
             Task.Run(() =>
@@ -471,7 +468,15 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
             if (dgvAlumnos.Columns["Id"] != null) dgvAlumnos.Columns["Id"].ReadOnly = true;
             if (dgvAlumnos.Columns["Estado"] != null) dgvAlumnos.Columns["Estado"].ReadOnly = true;
-            if (dgvAlumnos.Columns["FechaHora"] != null) dgvAlumnos.Columns["FechaHora"].ReadOnly = true;
+            DataGridViewColumn colFecha = dgvAlumnos.Columns["FechaHora"];
+            if (colFecha != null)
+            {
+                colFecha.ReadOnly = true;
+                colFecha.DefaultCellStyle.Format = "dd/MM/yyyy HH:mm:ss";
+                colFecha.AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells; // que nunca se corte la fecha
+            }
+            if (dgvAlumnos.Columns["Estado"] != null)
+                dgvAlumnos.Columns["Estado"].AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells;
         }
 
         private static byte[] VectorABytes(float[] v)
@@ -1373,7 +1378,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
                                 {
                                     try
                                     {
-                                        administradorSQL.MarcarAsistencia(idParaSql, estadoSql);
+                                        if (administradorSQL.MarcarAsistencia(idParaSql, estadoSql))
+                                            LogBiometria($"[{DateTime.Now:dd/MM/yyyy HH:mm:ss}] {identidad}: {estadoSql}");
                                         ActualizarGrilla();
                                     }
                                     catch (Exception ex)
@@ -1600,11 +1606,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             {
                 solicitudRegistro = false;
 
-                if (listaPersonas.Count >= MAX_PERSONAS)
-                {
-                    MostrarEstado($"Límite alcanzado ({MAX_PERSONAS} personas). Usa 'Borrar todo' para liberar espacio.");
-                }
-                else if (!registroActivo)
+                if (!registroActivo)
                 {
                     LiberarMuestrasRegistro();
                     registroActivo = true;
@@ -1918,10 +1920,11 @@ namespace Proyecto_ReconocimientoFacial_0._1
             EjecutarEnUI(() =>
             {
                 StringBuilder sb = new StringBuilder();
+                sb.AppendLine();
                 sb.AppendLine($"[{horaLocal}] ¡CAPTURA EXITOSA!");
                 sb.AppendLine($"  • Registrado como: {nombre}");
                 sb.AppendLine($"  • Muestras usadas para la plantilla: {MUESTRAS_REGISTRO}");
-                sb.AppendLine($"  • Estado: Guardado en memoria ({total}/{MAX_PERSONAS})");
+                sb.AppendLine($"  • [{DateTime.Now:dd/MM/yyyy HH:mm:ss}] Estado: Guardado en memoria ({total})");
                 sb.AppendLine("--------------------------------------------------");
                 textBox2.AppendText(sb.ToString());
                 
@@ -1982,6 +1985,96 @@ namespace Proyecto_ReconocimientoFacial_0._1
         }
 
         #region HORARIOS
+        private void LogEstadoMemoria()
+        {
+            int total = listaPersonas.Count;
+            EjecutarEnUI(() => textBox2.AppendText(
+                $"[{DateTime.Now:dd/MM/yyyy HH:mm:ss}] Estado: Guardado en memoria ({total})" + Environment.NewLine));
+        }
+        private readonly List<string> historialHorarios = new List<string>();
+
+        private static string TextoHorario(HorarioDia h)
+        {
+            return (h == null || h.EstaVacio)
+                ? "--"
+                : GestorHorarios.Formato(h.Inicio.Value) + " - " + GestorHorarios.Formato(h.Fin.Value);
+        }
+
+        // Agrega al historial: [fecha y hora] Paso de [anterior] a [actual]
+        private void RegistrarCambioHorario(DayOfWeek dia, string antes, string despues, string accion)
+        {
+            string nombreDia = DIAS_NOMBRES[Array.IndexOf(DIAS_ORDEN, dia)];
+            historialHorarios.Add($"[{DateTime.Now:dd/MM/yyyy HH:mm:ss}] Paso de {antes} a {despues}  ({nombreDia}: {accion})");
+            RefrescarPestanaHorario();
+        }
+
+        // Arriba: los 7 días en orden. Después una línea, un renglón en blanco y el historial (lo más reciente primero).
+        private void RefrescarPestanaHorario()
+        {
+            if (textBoxHorario == null) return;
+            if (InvokeRequired) { EjecutarEnUI(RefrescarPestanaHorario); return; }
+
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < DIAS_ORDEN.Length; i++)
+                sb.AppendLine(DIAS_NOMBRES[i] + ": " + TextoHorario(gestorHorarios.Obtener(DIAS_ORDEN[i])));
+
+            sb.AppendLine(new string('-', 48));
+            sb.AppendLine();
+
+            for (int i = historialHorarios.Count - 1; i >= 0; i--)
+                sb.AppendLine(historialHorarios[i]);
+
+            textBoxHorario.Text = sb.ToString();
+        }
+        private DateTime fechaUltimoReinicio = DateTime.MinValue;
+
+        // Reinicio diario: se ejecuta al iniciar y cada vez que el reloj cambia de día
+        private void ReiniciarEstadosVencidos()
+        {
+            if (!sqlDisponible) return;
+            DateTime hoy = DateTime.Today;
+            if (fechaUltimoReinicio == hoy) return;
+            fechaUltimoReinicio = hoy;
+
+            Task.Run(() =>
+            {
+                try
+                {
+                    int n = administradorSQL.ReiniciarEstadosVencidos();
+                    if (n > 0)
+                    {
+                        ultimoSujetoNotificado = "";   // para que quien esté frente a la cámara vuelva a fichar
+                        LogBiometria($"[{DateTime.Now:dd/MM/yyyy HH:mm:ss}] Nuevo día: {n} estado(s) reiniciado(s) a Ausente.");
+                        ActualizarGrilla();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    fechaUltimoReinicio = DateTime.MinValue; // reintenta en el próximo ciclo
+                    LogMensaje($"[AVISO] No se pudieron reiniciar los estados: {ex.Message}");
+                }
+            });
+        }
+
+        // Reinicio por cambio del horario de hoy
+        private void ReiniciarAsistenciaPorCambioDeHorario()
+        {
+            if (!sqlDisponible) return;
+            Task.Run(() =>
+            {
+                try
+                {
+                    int n = administradorSQL.ReiniciarTodosLosEstados();
+                    ultimoSujetoNotificado = "";
+                    LogBiometria($"[{DateTime.Now:dd/MM/yyyy HH:mm:ss}] Horario modificado: {n} estado(s) reiniciado(s) a Ausente.");
+                    ActualizarGrilla();
+                }
+                catch (Exception ex)
+                {
+                    LogMensaje($"[AVISO] No se pudieron reiniciar los estados: {ex.Message}");
+                }
+            });
+        }
         private static readonly string[] DIAS_NOMBRES = { "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo" };
         private static readonly DayOfWeek[] DIAS_ORDEN =
         {
@@ -2007,10 +2100,12 @@ namespace Proyecto_ReconocimientoFacial_0._1
             // El indicador cambia con el reloj (verde -> amarillo -> rojo), así que se refresca solo
             timerHorario = new System.Windows.Forms.Timer();
             timerHorario.Interval = 5000;
-            timerHorario.Tick += (s, e) => ActualizarIndicadorHorario();
+            timerHorario.Tick += (s, e) => { ActualizarIndicadorHorario(); ReiniciarEstadosVencidos(); };
             timerHorario.Start();
 
             Application.AddMessageFilter(this); // para detectar "clic fuera del panel"
+
+            RefrescarPestanaHorario();
         }
 
         private void DetenerHorarios()
@@ -2030,7 +2125,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
             {
                 LogMensaje($"[AVISO] No se pudieron leer los horarios: {ex.Message}");
             }
-            EjecutarEnUI(() => { CargarCamposHorarioDelDia(); ActualizarIndicadorHorario(); });
+            ReiniciarEstadosVencidos(); // al iniciar el programa también se limpian los estados de días anteriores
+            EjecutarEnUI(() => { CargarCamposHorarioDelDia(); ActualizarIndicadorHorario(); RefrescarPestanaHorario(); });
         }
 
         // ---------- REQUISITO 1: solo dígitos, máximo 2 ----------
@@ -2077,6 +2173,10 @@ namespace Proyecto_ReconocimientoFacial_0._1
             fin = TimeSpan.Zero;
             TextBox[] cajas = { txtHoraIni, txtMinIni, txtHoraFin, txtMinFin };
 
+            // Si hay hora pero faltan los minutos, se completan con "00" para agilizar la carga
+            if (txtHoraIni.TextLength > 0 && txtMinIni.TextLength == 0) txtMinIni.Text = "00";
+            if (txtHoraFin.TextLength > 0 && txtMinFin.TextLength == 0) txtMinFin.Text = "00";
+
             if (cajas.All(c => c.TextLength == 0))
             {
                 AvisarHorario("Ingresá la hora de inicio y la de fin.\nSi querés dejar el día sin horario, usá \"Vaciar Día\".", txtHoraIni);
@@ -2117,28 +2217,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             foco.SelectAll();
         }
 
-        // ---------- REQUISITO 8: Guardar ----------
-        private void BtnHorarioGuardar_Click(object sender, EventArgs e)
-        {
-            TimeSpan inicio, fin;
-            if (!ValidarYLeerHorario(out inicio, out fin)) return;
-
-            try
-            {
-                if (sqlDisponible) administradorSQL.GuardarHorario(DiaSeleccionado, inicio, fin);
-            }
-            catch (Exception ex)
-            {
-                // Si SQL falla no se toca la memoria: la pantalla nunca muestra algo que no se guardó
-                MessageBox.Show(this, "No se pudo guardar en SQL Server:\n" + ex.Message,
-                                "Horarios", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
-            }
-
-            gestorHorarios.Establecer(new HorarioDia { Dia = DiaSeleccionado, Inicio = inicio, Fin = fin });
-            CargarCamposHorarioDelDia();
-            ActualizarIndicadorHorario(); // actualización visual inmediata
-        }
+        
 
         // ---------- REQUISITO 6: Limpiar ----------
         private void BtnHorarioLimpiar_Click(object sender, EventArgs e)
@@ -2146,16 +2225,52 @@ namespace Proyecto_ReconocimientoFacial_0._1
             CargarCamposHorarioDelDia();
         }
 
-        // ---------- REQUISITO 7: Vaciar Día ----------
-        private void BtnHorarioVaciar_Click(object sender, EventArgs e)
+        // ---------- REQUISITO 7 - 8: Vaciar Día y guardar ----------
+        private void BtnHorarioGuardar_Click(object sender, EventArgs e)
         {
-            string dia = DIAS_NOMBRES[cboDia.SelectedIndex];
-            if (MessageBox.Show(this, "¿Vaciar el horario del día " + dia + "?", "Horarios",
-                                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            TimeSpan inicio, fin;
+            if (!ValidarYLeerHorario(out inicio, out fin)) return;
+
+            DayOfWeek dia = DiaSeleccionado;
+            string antes = TextoHorario(gestorHorarios.Obtener(dia));
 
             try
             {
-                if (sqlDisponible) administradorSQL.GuardarHorario(DiaSeleccionado, null, null);
+                if (sqlDisponible) administradorSQL.GuardarHorario(dia, inicio, fin);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "No se pudo guardar en SQL Server:\n" + ex.Message,
+                                "Horarios", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            HorarioDia nuevo = new HorarioDia { Dia = dia, Inicio = inicio, Fin = fin };
+            gestorHorarios.Establecer(nuevo);
+            string despues = TextoHorario(nuevo);
+
+            if (antes != despues)
+            {
+                RegistrarCambioHorario(dia, antes, despues, "horario actualizado");
+                if (dia == DateTime.Now.DayOfWeek) ReiniciarAsistenciaPorCambioDeHorario();
+            }
+
+            CargarCamposHorarioDelDia();
+            ActualizarIndicadorHorario();
+        }
+
+        private void BtnHorarioVaciar_Click(object sender, EventArgs e)
+        {
+            DayOfWeek dia = DiaSeleccionado;
+            string nombreDia = DIAS_NOMBRES[cboDia.SelectedIndex];
+            if (MessageBox.Show(this, "¿Vaciar el horario del día " + nombreDia + "?", "Horarios",
+                                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+
+            string antes = TextoHorario(gestorHorarios.Obtener(dia));
+
+            try
+            {
+                if (sqlDisponible) administradorSQL.GuardarHorario(dia, null, null);
             }
             catch (Exception ex)
             {
@@ -2164,7 +2279,14 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 return;
             }
 
-            gestorHorarios.Establecer(new HorarioDia { Dia = DiaSeleccionado, Inicio = null, Fin = null });
+            gestorHorarios.Establecer(new HorarioDia { Dia = dia, Inicio = null, Fin = null });
+
+            if (antes != "--")
+            {
+                RegistrarCambioHorario(dia, antes, "--", "horario borrado correctamente");
+                if (dia == DateTime.Now.DayOfWeek) ReiniciarAsistenciaPorCambioDeHorario();
+            }
+
             CargarCamposHorarioDelDia();
             ActualizarIndicadorHorario();
         }

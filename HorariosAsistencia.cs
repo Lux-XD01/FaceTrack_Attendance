@@ -73,9 +73,13 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
     public class GestorHorarios
     {
-        // ---- Reglas del informe (Objetivos secundarios: "Manejo de Horarios y Tolerancia") ----
-        public static readonly TimeSpan TOLERANCIA_PRESENTE = TimeSpan.FromMinutes(15);
-        public static readonly TimeSpan CIERRE_ANTES_DEL_FIN = TimeSpan.FromHours(1);
+        // Los márgenes son proporcionales a la duración de la clase de ESE día:
+        //   Presente      : hasta el 15 % de la duración (clase de 60 min = primeros 15 min)
+        //   Llegada tarde : del 15 % al 85 % de la duración
+        //   Rechazado     : pasado el 85 % ("No se puede registrar, llegada tardía")
+        // Como 15 % < 85 % siempre, los tramos nunca se pisan, sea la clase larga o corta.
+        public const double PORCENTAJE_PRESENTE = 0.15;
+        public const double PORCENTAJE_LIMITE_TARDE = 0.85;
 
         // false = si hoy no hay horario cargado, se sigue fichando como siempre (como antes de agregar
         //         esta función). true = sin horario no se puede fichar.
@@ -127,8 +131,9 @@ namespace Proyecto_ReconocimientoFacial_0._1
             TimeSpan t = ahora.TimeOfDay;
             TimeSpan inicio = h.Inicio.Value;
             TimeSpan fin = h.Fin.Value;
-            TimeSpan limitePresente = inicio + TOLERANCIA_PRESENTE;   // inicio + 15 min
-            TimeSpan limiteTarde = fin - CIERRE_ANTES_DEL_FIN;        // fin - 1 h
+            TimeSpan duracion = fin - inicio;
+            TimeSpan limitePresente = inicio + TimeSpan.FromTicks((long)(duracion.Ticks * PORCENTAJE_PRESENTE));
+            TimeSpan limiteTarde = inicio + TimeSpan.FromTicks((long)(duracion.Ticks * PORCENTAJE_LIMITE_TARDE));
 
             if (t < inicio)
                 return Rechazo(EstadoFichaje.TodaviaNoEmpezo,

@@ -34,6 +34,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
         private ComboBox cboDia;
         private Button btnHorarioGuardar, btnHorarioLimpiar, btnHorarioVaciar, btnHorarioDescargar;
         private Label lblHorarioIndicador, lblHorarioEstado;
+        private TextBox textBoxHorario;
         private System.Windows.Forms.Timer timerHorario;
 
         private void ConstruirInterfaz()
@@ -140,6 +141,9 @@ namespace Proyecto_ReconocimientoFacial_0._1
             tabs.TabPages.Add(CrearPagina("LOGS (SFace)", textBox2, true));
             tabs.TabPages.Add(CrearPagina("LOGS CONEXIÓN", textBox3, true));
             tabs.TabPages.Add(CrearPagina("MÉTRICAS VIVO", textBox1, false));
+            textBoxHorario = new TextBox();
+            textBoxHorario.Name = "textBoxHorario";
+            tabs.TabPages.Add(CrearPagina("HORARIO", textBoxHorario, true));
             tabs.SelectedIndex = 2; // arranca mostrando las métricas
             panelLogs.Controls.Add(tabs);
             inferior.Controls.Add(panelLogs, 0, 0);

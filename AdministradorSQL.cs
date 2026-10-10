@@ -314,6 +314,36 @@ WHERE Id = @Id
             }
         }
 
+
+        // Reinicio por día nuevo: pone en "Ausente" a quien tenga un fichaje de un día anterior.
+        public int ReiniciarEstadosVencidos()
+        {
+            const string sql = @"
+UPDATE Alumnos SET Estado = 'Ausente', FechaHora = NULL
+WHERE Estado <> 'Ausente'
+  AND (FechaHora IS NULL OR CAST(FechaHora AS DATE) < CAST(GETDATE() AS DATE))";
+            using (SqlConnection cn = new SqlConnection(cadenaConexion))
+            using (SqlCommand cmd = new SqlCommand(sql, cn))
+            {
+                cn.Open();
+                return cmd.ExecuteNonQuery();
+            }
+        }
+
+        // Reinicio por cambio de horario: TODOS vuelven a "Ausente" sin importar la hora en que ficharon.
+        public int ReiniciarTodosLosEstados()
+        {
+            const string sql = @"
+UPDATE Alumnos SET Estado = 'Ausente', FechaHora = NULL
+WHERE Estado <> 'Ausente' OR FechaHora IS NOT NULL";
+            using (SqlConnection cn = new SqlConnection(cadenaConexion))
+            using (SqlCommand cmd = new SqlCommand(sql, cn))
+            {
+                cn.Open();
+                return cmd.ExecuteNonQuery();
+            }
+        }
+
         // Recupera Id + Nombre + Plantilla de todos los sujetos, para reconstruir la lista de
         // reconocimiento en memoria al iniciar el programa (así no se pierden los registros al reiniciar).
         public List<(int Id, string Nombre, byte[] Plantilla)> ObtenerPlantillas()
