@@ -81,6 +81,7 @@ END";
             {
                 cn.Open();
                 cmd.ExecuteNonQuery();
+                AsegurarEsquemaHorarios();
             }
         }
 
@@ -224,6 +225,92 @@ ORDER BY Id";
             {
                 cn.Open();
                 cmd.ExecuteNonQuery();
+            }
+        }
+
+        // ---------------- HORARIOS ----------------
+        // Tabla Horarios: Dia = (int)DayOfWeek (0 = Domingo ... 6 = Sábado). HoraInicio/HoraFin = NULL => día vacío.
+        public void AsegurarEsquemaHorarios()
+        {
+            const string sql = @"
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'Horarios')
+BEGIN
+    CREATE TABLE Horarios (
+        Dia        TINYINT NOT NULL PRIMARY KEY,
+        HoraInicio TIME(0) NULL,
+        HoraFin    TIME(0) NULL
+    );
+END";
+            using (SqlConnection cn = new SqlConnection(cadenaConexion))
+            using (SqlCommand cmd = new SqlCommand(sql, cn))
+            {
+                cn.Open();
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        public List<HorarioDia> ObtenerHorarios()
+        {
+            const string sql = "SELECT Dia, HoraInicio, HoraFin FROM Horarios";
+            List<HorarioDia> lista = new List<HorarioDia>();
+
+            using (SqlConnection cn = new SqlConnection(cadenaConexion))
+            using (SqlCommand cmd = new SqlCommand(sql, cn))
+            {
+                cn.Open();
+                using (SqlDataReader reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        HorarioDia h = new HorarioDia();
+                        h.Dia = (DayOfWeek)Convert.ToInt32(reader["Dia"]);
+                        h.Inicio = reader.IsDBNull(1) ? (TimeSpan?)null : (TimeSpan)reader["HoraInicio"];
+                        h.Fin = reader.IsDBNull(2) ? (TimeSpan?)null : (TimeSpan)reader["HoraFin"];
+                        lista.Add(h);
+                    }
+                }
+            }
+            return lista;
+        }
+
+        // inicio = null y fin = null deja el día vacío ("Vaciar Día")
+        public void GuardarHorario(DayOfWeek dia, TimeSpan? inicio, TimeSpan? fin)
+        {
+            const string sql = @"
+MERGE Horarios AS destino
+USING (SELECT @Dia AS Dia) AS origen ON destino.Dia = origen.Dia
+WHEN MATCHED THEN UPDATE SET HoraInicio = @Inicio, HoraFin = @Fin
+WHEN NOT MATCHED THEN INSERT (Dia, HoraInicio, HoraFin) VALUES (@Dia, @Inicio, @Fin);";
+
+            using (SqlConnection cn = new SqlConnection(cadenaConexion))
+            using (SqlCommand cmd = new SqlCommand(sql, cn))
+            {
+                cmd.Parameters.Add("@Dia", SqlDbType.TinyInt).Value = (byte)(int)dia;
+                cmd.Parameters.Add("@Inicio", SqlDbType.Time).Value = inicio.HasValue ? (object)inicio.Value : DBNull.Value;
+                cmd.Parameters.Add("@Fin", SqlDbType.Time).Value = fin.HasValue ? (object)fin.Value : DBNull.Value;
+                cn.Open();
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        // Solo escribe si la persona todavía NO fichó HOY (evita que un "Presente" se degrade a
+        // "Llegada tarde" cuando vence el cooldown y la cámara la vuelve a reconocer).
+        public bool MarcarAsistencia(int id, string estado)
+        {
+            const string sql = @"
+UPDATE Alumnos
+SET Estado = @Estado, FechaHora = @Fecha
+WHERE Id = @Id
+  AND (Estado = 'Ausente' OR FechaHora IS NULL OR CAST(FechaHora AS DATE) < CAST(@Fecha AS DATE))";
+
+            using (SqlConnection cn = new SqlConnection(cadenaConexion))
+            using (SqlCommand cmd = new SqlCommand(sql, cn))
+            {
+                cmd.Parameters.AddWithValue("@Estado", estado);
+                cmd.Parameters.AddWithValue("@Fecha", DateTime.Now);
+                cmd.Parameters.AddWithValue("@Id", id);
+                cn.Open();
+                return cmd.ExecuteNonQuery() > 0;
             }
         }
 

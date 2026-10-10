@@ -26,6 +26,10 @@
 //   - Si SQL Server no está disponible, el programa sigue funcionando solo en memoria (no bloquea
 //     las pruebas de reconocimiento) y lo avisa en el log.
 
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
 using Emgu.CV;
 using Emgu.CV.CvEnum;
 using Emgu.CV.Face;
@@ -116,7 +120,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
         // Cámara ESP32 - debe coincidir EXACTO con la IP fija que pusiste en el .ino (local_IP).
         // Si volvés a cambiar la IP fija en el firmware, actualizala también acá.
-        private readonly string ipCamara = "192.168.1.112";
+        private readonly string ipCamara = "192.168.1.100";
         private readonly string streamUrl;
         private readonly string tempUrl;
         private readonly TimeSpan intervaloTemp = TimeSpan.FromSeconds(20);
@@ -256,6 +260,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
             this.FormClosing += Form1_FormClosing;
 
             Estetica.AplicarEstilo(this);
+            AplicarEstiloHorarios();
+            IniciarHorarios();
 
             // txtBuscar: se guarda el color de texto ya estilizado para poder restaurarlo tras mostrar el aviso en rojo
             colorTextoBuscarOriginal = txtBuscar.ForeColor;
@@ -388,6 +394,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 administradorSQL.AsegurarBaseDeDatos();
                 administradorSQL.AsegurarEsquema();
                 sqlDisponible = true;
+                CargarHorariosDesdeSql();
                 LogMensaje("[OK] Conectado a SQL Server.");
 
                 CargarPersonasDesdeSql();
@@ -1317,7 +1324,9 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
                 // Solo el recuadro de color; el nombre y el estado van únicamente al pie.
                 MarcarRostro(rect, null, color);
-               
+
+                ResultadoFichaje fichaje = conocido ? gestorHorarios.Evaluar(DateTime.Now) : null;
+
                 // Mensaje al pie de la imagen
                 if (analizando)
                 {
@@ -1326,8 +1335,9 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 }
                 else if (conocido)
                 {
-                    pieEstadoTexto = $"{identidad} está presente";
-                    pieEstadoColor = COLOR_VERDE;
+                    pieEstadoTexto = fichaje.MensajePantalla(identidad);
+                    pieEstadoColor = fichaje.Estado == EstadoFichaje.LlegadaTarde ? COLOR_AMARILLO
+                                   : fichaje.Permitido ? COLOR_VERDE : COLOR_ROJO;
                 }
                 else
                 {
@@ -1350,19 +1360,20 @@ namespace Proyecto_ReconocimientoFacial_0._1
                     {
                         ultimoSujetoNotificado = identidad;
                         ultimaNotificacion = DateTime.Now;
-                                              
+
                         // Marca presente en SQL fuera del lock: la latencia de red no debe frenar el video.
-                        if (sqlDisponible && conocido)
+                        if (sqlDisponible && conocido && fichaje.Permitido)
                         {
                             PersonaRegistrada persona = listaPersonas.FirstOrDefault(p => p.Nombre == identidad);
                             if (persona?.IdBd != null)
                             {
                                 int idParaSql = persona.IdBd.Value;
+                                string estadoSql = fichaje.TextoSql;
                                 Task.Run(() =>
                                 {
                                     try
                                     {
-                                        administradorSQL.MarcarPresente(idParaSql);
+                                        administradorSQL.MarcarAsistencia(idParaSql, estadoSql);
                                         ActualizarGrilla();
                                     }
                                     catch (Exception ex)
@@ -1970,8 +1981,266 @@ namespace Proyecto_ReconocimientoFacial_0._1
             }
         }
 
+        #region HORARIOS
+        private static readonly string[] DIAS_NOMBRES = { "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo" };
+        private static readonly DayOfWeek[] DIAS_ORDEN =
+        {
+    DayOfWeek.Monday, DayOfWeek.Tuesday, DayOfWeek.Wednesday, DayOfWeek.Thursday,
+    DayOfWeek.Friday, DayOfWeek.Saturday, DayOfWeek.Sunday
+};
+
+        private const int HOR_WM_LBUTTONDOWN = 0x0201;
+        private const int HOR_EM_SETCUEBANNER = 0x1501;
+
+        [DllImport("user32.dll", EntryPoint = "SendMessage", CharSet = CharSet.Unicode)]
+        private static extern IntPtr HorSendMessage(IntPtr hWnd, int msg, IntPtr wParam, string lParam);
+
+        private DayOfWeek DiaSeleccionado
+        {
+            get { return DIAS_ORDEN[Math.Max(0, cboDia.SelectedIndex)]; }
+        }
+
+        private void IniciarHorarios()
+        {
+            cboDia.SelectedIndex = Array.IndexOf(DIAS_ORDEN, DateTime.Now.DayOfWeek); // arranca en el día de hoy
+
+            // El indicador cambia con el reloj (verde -> amarillo -> rojo), así que se refresca solo
+            timerHorario = new System.Windows.Forms.Timer();
+            timerHorario.Interval = 5000;
+            timerHorario.Tick += (s, e) => ActualizarIndicadorHorario();
+            timerHorario.Start();
+
+            Application.AddMessageFilter(this); // para detectar "clic fuera del panel"
+        }
+
+        private void DetenerHorarios()
+        {
+            Application.RemoveMessageFilter(this);
+            if (timerHorario != null) { timerHorario.Stop(); timerHorario.Dispose(); timerHorario = null; }
+        }
+
+        private void CargarHorariosDesdeSql()
+        {
+            try
+            {
+                gestorHorarios.Reemplazar(administradorSQL.ObtenerHorarios());
+                LogMensaje("[OK] Horarios cargados desde SQL Server.");
+            }
+            catch (Exception ex)
+            {
+                LogMensaje($"[AVISO] No se pudieron leer los horarios: {ex.Message}");
+            }
+            EjecutarEnUI(() => { CargarCamposHorarioDelDia(); ActualizarIndicadorHorario(); });
+        }
+
+        // ---------- REQUISITO 1: solo dígitos, máximo 2 ----------
+        private void HoraKeyPress(object sender, KeyPressEventArgs e)
+        {
+            if (!char.IsControl(e.KeyChar) && (e.KeyChar < '0' || e.KeyChar > '9'))
+                e.Handled = true;
+        }
+
+        private void HoraTextChanged(object sender, EventArgs e) // cubre el pegado (Ctrl+V)
+        {
+            TextBox tb = (TextBox)sender;
+            string limpio = new string(tb.Text.Where(c => c >= '0' && c <= '9').ToArray());
+            if (limpio != tb.Text)
+            {
+                tb.Text = limpio;
+                tb.SelectionStart = tb.TextLength;
+            }
+        }
+
+        private void HoraLeave(object sender, EventArgs e) // "5" -> "05"
+        {
+            TextBox tb = (TextBox)sender;
+            if (tb.TextLength == 1) tb.Text = "0" + tb.Text;
+        }
+
+        // ---------- Campos <-> horario guardado ----------
+        // Pone en las cajas el horario GUARDADO del día elegido (o las deja en blanco).
+        private void CargarCamposHorarioDelDia()
+        {
+            HorarioDia h = gestorHorarios.Obtener(DiaSeleccionado);
+            bool hay = h != null && !h.EstaVacio;
+
+            txtHoraIni.Text = hay ? h.Inicio.Value.Hours.ToString("00") : "";
+            txtMinIni.Text = hay ? h.Inicio.Value.Minutes.ToString("00") : "";
+            txtHoraFin.Text = hay ? h.Fin.Value.Hours.ToString("00") : "";
+            txtMinFin.Text = hay ? h.Fin.Value.Minutes.ToString("00") : "";
+        }
+
+        // ---------- REQUISITO 2: rango válido ----------
+        private bool ValidarYLeerHorario(out TimeSpan inicio, out TimeSpan fin)
+        {
+            inicio = TimeSpan.Zero;
+            fin = TimeSpan.Zero;
+            TextBox[] cajas = { txtHoraIni, txtMinIni, txtHoraFin, txtMinFin };
+
+            if (cajas.All(c => c.TextLength == 0))
+            {
+                AvisarHorario("Ingresá la hora de inicio y la de fin.\nSi querés dejar el día sin horario, usá \"Vaciar Día\".", txtHoraIni);
+                return false;
+            }
+            foreach (TextBox c in cajas)
+            {
+                if (c.TextLength == 0)
+                {
+                    AvisarHorario("Completá los cuatro campos (HH y MM de inicio y de fin).", c);
+                    return false;
+                }
+            }
+
+            int hi = int.Parse(txtHoraIni.Text), mi = int.Parse(txtMinIni.Text);
+            int hf = int.Parse(txtHoraFin.Text), mf = int.Parse(txtMinFin.Text);
+
+            if (hi > 23) { AvisarHorario("La hora de inicio debe estar entre 00 y 23.", txtHoraIni); return false; }
+            if (mi > 59) { AvisarHorario("Los minutos de inicio deben estar entre 00 y 59.", txtMinIni); return false; }
+            if (hf > 23) { AvisarHorario("La hora de fin debe estar entre 00 y 23.", txtHoraFin); return false; }
+            if (mf > 59) { AvisarHorario("Los minutos de fin deben estar entre 00 y 59.", txtMinFin); return false; }
+
+            inicio = new TimeSpan(hi, mi, 0);
+            fin = new TimeSpan(hf, mf, 0);
+
+            if (inicio >= fin)
+            {
+                AvisarHorario("La hora de inicio debe ser anterior a la hora de fin.", txtHoraFin);
+                return false;
+            }
+            return true;
+        }
+
+        private void AvisarHorario(string mensaje, TextBox foco)
+        {
+            MessageBox.Show(this, mensaje, "Horarios", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            foco.Focus();
+            foco.SelectAll();
+        }
+
+        // ---------- REQUISITO 8: Guardar ----------
+        private void BtnHorarioGuardar_Click(object sender, EventArgs e)
+        {
+            TimeSpan inicio, fin;
+            if (!ValidarYLeerHorario(out inicio, out fin)) return;
+
+            try
+            {
+                if (sqlDisponible) administradorSQL.GuardarHorario(DiaSeleccionado, inicio, fin);
+            }
+            catch (Exception ex)
+            {
+                // Si SQL falla no se toca la memoria: la pantalla nunca muestra algo que no se guardó
+                MessageBox.Show(this, "No se pudo guardar en SQL Server:\n" + ex.Message,
+                                "Horarios", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            gestorHorarios.Establecer(new HorarioDia { Dia = DiaSeleccionado, Inicio = inicio, Fin = fin });
+            CargarCamposHorarioDelDia();
+            ActualizarIndicadorHorario(); // actualización visual inmediata
+        }
+
+        // ---------- REQUISITO 6: Limpiar ----------
+        private void BtnHorarioLimpiar_Click(object sender, EventArgs e)
+        {
+            CargarCamposHorarioDelDia();
+        }
+
+        // ---------- REQUISITO 7: Vaciar Día ----------
+        private void BtnHorarioVaciar_Click(object sender, EventArgs e)
+        {
+            string dia = DIAS_NOMBRES[cboDia.SelectedIndex];
+            if (MessageBox.Show(this, "¿Vaciar el horario del día " + dia + "?", "Horarios",
+                                MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+
+            try
+            {
+                if (sqlDisponible) administradorSQL.GuardarHorario(DiaSeleccionado, null, null);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "No se pudo vaciar el día en SQL Server:\n" + ex.Message,
+                                "Horarios", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            gestorHorarios.Establecer(new HorarioDia { Dia = DiaSeleccionado, Inicio = null, Fin = null });
+            CargarCamposHorarioDelDia();
+            ActualizarIndicadorHorario();
+        }
+
+        // Exporta los 7 días a CSV (separado por ";" para que Excel en español lo abra en columnas)
+        private void BtnHorarioDescargar_Click(object sender, EventArgs e)
+        {
+            using (SaveFileDialog dlg = new SaveFileDialog())
+            {
+                dlg.Filter = "CSV (*.csv)|*.csv";
+                dlg.FileName = "horarios.csv";
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine("Dia;Inicio;Fin");
+                for (int i = 0; i < DIAS_ORDEN.Length; i++)
+                {
+                    HorarioDia h = gestorHorarios.Obtener(DIAS_ORDEN[i]);
+                    bool hay = h != null && !h.EstaVacio;
+                    sb.AppendLine(DIAS_NOMBRES[i] + ";" +
+                                  (hay ? GestorHorarios.Formato(h.Inicio.Value) : "") + ";" +
+                                  (hay ? GestorHorarios.Formato(h.Fin.Value) : ""));
+                }
+
+                try { File.WriteAllText(dlg.FileName, sb.ToString(), new UTF8Encoding(true)); }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, "No se pudo guardar el archivo:\n" + ex.Message,
+                                    "Horarios", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+        }
+
+        // ---------- Indicador (verde / amarillo / rojo / gris) - siempre refleja el horario de HOY ----------
+        private void ActualizarIndicadorHorario()
+        {
+            if (IsDisposed || lblHorarioIndicador == null) return;
+            if (InvokeRequired) { BeginInvoke(new Action(ActualizarIndicadorHorario)); return; }
+
+            ResultadoFichaje r = gestorHorarios.Evaluar(DateTime.Now);
+            Color color;
+            switch (r.Estado)
+            {
+                case EstadoFichaje.Presente: color = Estetica.ColorExito; break;
+                case EstadoFichaje.LlegadaTarde: color = Color.FromArgb(240, 200, 60); break;
+                case EstadoFichaje.LlegadaTardia:
+                case EstadoFichaje.ClasesTerminadas: color = Estetica.ColorPeligro; break;
+                default: color = Color.Gray; break; // TodaviaNoEmpezo / SinHorario
+            }
+
+            lblHorarioIndicador.ForeColor = color;
+            lblHorarioEstado.Text = r.Descripcion + (sqlDisponible ? "" : "  (solo en memoria)");
+        }
+
+        // ---------- REQUISITO 6 (parte 2): clic fuera del panel => restaurar el horario guardado ----------
+        // Un clic sobre algo que no recibe foco (el video, una etiqueta) NO dispara el evento Leave,
+        // por eso se escucha el clic izquierdo de toda la aplicación (interfaz IMessageFilter).
+        public bool PreFilterMessage(ref Message m)
+        {
+            if (m.Msg != HOR_WM_LBUTTONDOWN || !IsHandleCreated || panelHorarios == null) return false;
+
+            Control destino = Control.FromHandle(m.HWnd);
+            if (destino == null || destino.FindForm() != this) return false; // MessageBox, lista del combo, otros formularios
+            if (cboDia.DroppedDown) return false;                            // eligiendo un día de la lista
+
+            for (Control c = destino; c != null; c = c.Parent)
+                if (c == panelHorarios) return false;                        // clic DENTRO del panel de horarios
+
+            CargarCamposHorarioDelDia(); // clic fuera: se descartan los cambios sin guardar
+            return false;                // el clic sigue su curso normal
+        }
+        #endregion
+
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
         {
+            DetenerHorarios();
             isDisposing = true;
             cancellationTokenSource?.Cancel();
             timerEstadoConexion?.Stop();
