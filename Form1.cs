@@ -2320,33 +2320,29 @@ namespace Proyecto_ReconocimientoFacial_0._1
             ActualizarIndicadorHorario();
         }
 
-        // Exporta los 7 días a CSV (separado por ";" para que Excel en español lo abra en columnas)
+        // Tabla de 7 filas (Dia / Inicio / Fin) con el mismo formato que muestra la pestaña HORARIO: "--" si el día no tiene horario
+        private DataTable ConstruirTablaHorarios()
+        {
+            DataTable tabla = new DataTable("Horarios");
+            tabla.Columns.Add("Dia", typeof(string));
+            tabla.Columns.Add("Inicio", typeof(string));
+            tabla.Columns.Add("Fin", typeof(string));
+
+            for (int i = 0; i < DIAS_ORDEN.Length; i++)
+            {
+                HorarioDia h = gestorHorarios.Obtener(DIAS_ORDEN[i]);
+                bool hay = h != null && !h.EstaVacio;
+                tabla.Rows.Add(DIAS_NOMBRES[i],
+                               hay ? GestorHorarios.Formato(h.Inicio.Value) : "--",
+                               hay ? GestorHorarios.Formato(h.Fin.Value) : "--");
+            }
+            return tabla;
+        }
+
+        // Botón "Descargar" del panel HORARIOS: PDF, CSV, JSON, XML, HTML o TXT según la extensión / el "Tipo:"
         private void BtnHorarioDescargar_Click(object sender, EventArgs e)
         {
-            using (SaveFileDialog dlg = new SaveFileDialog())
-            {
-                dlg.Filter = "CSV (*.csv)|*.csv";
-                dlg.FileName = "horarios.csv";
-                if (dlg.ShowDialog(this) != DialogResult.OK) return;
-
-                StringBuilder sb = new StringBuilder();
-                sb.AppendLine("Dia;Inicio;Fin");
-                for (int i = 0; i < DIAS_ORDEN.Length; i++)
-                {
-                    HorarioDia h = gestorHorarios.Obtener(DIAS_ORDEN[i]);
-                    bool hay = h != null && !h.EstaVacio;
-                    sb.AppendLine(DIAS_NOMBRES[i] + ";" +
-                                  (hay ? GestorHorarios.Formato(h.Inicio.Value) : "") + ";" +
-                                  (hay ? GestorHorarios.Formato(h.Fin.Value) : ""));
-                }
-
-                try { File.WriteAllText(dlg.FileName, sb.ToString(), new UTF8Encoding(true)); }
-                catch (Exception ex)
-                {
-                    MessageBox.Show(this, "No se pudo guardar el archivo:\n" + ex.Message,
-                                    "Horarios", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
-            }
+            ExportarTabla(ConstruirTablaHorarios(), "Horarios", "FaceTrack Attendance - Horarios de asistencia", "Horarios");
         }
 
         // ---------- Indicador (verde / amarillo / rojo / gris) - siempre refleja el horario de HOY ----------

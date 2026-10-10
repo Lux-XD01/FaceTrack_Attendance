@@ -14,28 +14,37 @@ namespace Proyecto_ReconocimientoFacial_0._1
     public partial class Form1
     {
         private Button btnGuardarComo;
-        private ContextMenuStrip menuExportar;
 
-        // Se llama desde ConstruirInterfaz() (Form1.Diseno.cs)
+        // Se llama desde ConstruirInterfaz() (Form1_Diseno.cs)
         private void ConfigurarExportacion()
         {
             btnGuardarComo = new Button();
             btnGuardarComo.Name = "btnGuardarComo";
-            btnGuardarComo.Text = "Guardar como...  ▾";
-
-            menuExportar = new ContextMenuStrip();
-            menuExportar.Items.Add("CSV (.csv) - Excel / hojas de cálculo", null, (s, e) => ExportarGrilla("csv"));
-            menuExportar.Items.Add("JSON (.json)", null, (s, e) => ExportarGrilla("json"));
-            menuExportar.Items.Add("XML (.xml)", null, (s, e) => ExportarGrilla("xml"));
-            menuExportar.Items.Add("Página web (.html)", null, (s, e) => ExportarGrilla("html"));
-            menuExportar.Items.Add("Texto tabulado (.txt)", null, (s, e) => ExportarGrilla("txt"));
-            menuExportar.Items.Add("PDF (.pdf)", null, (s, e) => ExportarGrilla("pdf"));
-
-            // El menú aparece justo debajo del botón
-            btnGuardarComo.Click += (s, e) => menuExportar.Show(btnGuardarComo, new Point(0, btnGuardarComo.Height));
+            btnGuardarComo.Text = "Guardar como...";
+            btnGuardarComo.Click += (s, e) => ExportarGrilla(); // abre directo el cuadro de Windows
         }
 
-        private void ExportarGrilla(string formato)
+        // ---------------------------------------------------------------------------
+        // EXPORTACIÓN GENÉRICA (la usan la grilla de asistencia y el panel de horarios)
+        // ---------------------------------------------------------------------------
+        // Mismo orden que las entradas de FILTRO_EXPORTACION (FilterIndex empieza en 1)
+        private static readonly string[] FORMATOS_EXPORTACION = { "pdf", "csv", "json", "xml", "html", "txt" };
+
+        private const string FILTRO_EXPORTACION =
+            "PDF (*.pdf)|*.pdf" +
+            "|CSV - separado por comas (*.csv)|*.csv" +
+            "|JSON (*.json)|*.json" +
+            "|XML (*.xml)|*.xml" +
+            "|Página web (*.html)|*.html" +
+            "|Texto tabulado (*.txt)|*.txt";
+
+        private const char SEPARADOR_CSV = ';';
+
+        // true: la primera línea del CSV es "sep=," para que Excel en español (que espera ';') lo separe en columnas.
+        // false: CSV puro, sin esa línea (para programas que no la entienden, por ejemplo pandas).
+        private static readonly bool CSV_FORZAR_EXCEL = true;
+
+        private void ExportarGrilla()
         {
             DataTable tabla = dgvAlumnos.DataSource as DataTable;
             if (tabla == null || tabla.Rows.Count == 0)
@@ -44,46 +53,78 @@ namespace Proyecto_ReconocimientoFacial_0._1
                                 MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
+            ExportarTabla(tabla, "Asistencia", "FaceTrack Attendance - Registro de asistencia", "Alumnos");
+        }
 
-            string filtro;
-            switch (formato)
+        // Decide el formato: 1º la extensión REAL del nombre; 2º, si no tiene (o no es soportada), el "Tipo:" elegido.
+        private static string ResolverFormatoExportacion(string rutaElegida, int indiceFiltro, out string rutaFinal)
+        {
+            string formato = null;
+            switch (Path.GetExtension(rutaElegida).ToLowerInvariant())
             {
-                case "csv": filtro = "CSV (*.csv)|*.csv"; break;
-                case "json": filtro = "JSON (*.json)|*.json"; break;
-                case "xml": filtro = "XML (*.xml)|*.xml"; break;
-                case "html": filtro = "Página web (*.html)|*.html"; break;
-                case "pdf": filtro = "PDF (*.pdf)|*.pdf"; break;
-                default: filtro = "Texto (*.txt)|*.txt"; break;
+                case ".pdf": formato = "pdf"; break;
+                case ".csv": formato = "csv"; break;
+                case ".json": formato = "json"; break;
+                case ".xml": formato = "xml"; break;
+                case ".html":
+                case ".htm": formato = "html"; break;
+                case ".txt": formato = "txt"; break;
             }
 
+            if (formato != null)
+            {
+                rutaFinal = rutaElegida; // la extensión escrita queda tal cual y el contenido coincide con ella
+                return formato;
+            }
+
+            formato = FORMATOS_EXPORTACION[Math.Max(0, indiceFiltro - 1)];
+            rutaFinal = rutaElegida + "." + formato; // sin extensión válida: se agrega la del tipo elegido
+            return formato;
+        }
+
+        private void ExportarTabla(DataTable tabla, string prefijoArchivo, string tituloDocumento, string nombreXml)
+        {
             using (SaveFileDialog dialogo = new SaveFileDialog())
             {
-                dialogo.Title = "Guardar grilla como...";
-                dialogo.Filter = filtro;
-                dialogo.FileName = $"Asistencia_{DateTime.Now:yyyyMMdd_HHmm}";
+                dialogo.Title = "Guardar como...";
+                dialogo.Filter = FILTRO_EXPORTACION;
+                dialogo.FilterIndex = 1;       // PDF seleccionado por defecto
+                dialogo.DefaultExt = "pdf";
+                dialogo.AddExtension = true;
+                dialogo.FileName = $"{prefijoArchivo}_{DateTime.Now:yyyyMMdd_HHmm}";
                 dialogo.OverwritePrompt = true;
                 dialogo.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
 
                 if (dialogo.ShowDialog(this) != DialogResult.OK) return;
 
+                string ruta;
+                string formato = ResolverFormatoExportacion(dialogo.FileName, dialogo.FilterIndex, out ruta);
+
+                // Si agregamos la extensión nosotros, Windows no pudo avisar de una posible sobrescritura
+                if (ruta != dialogo.FileName && File.Exists(ruta) &&
+                    MessageBox.Show(this, $"El archivo ya existe:\n{ruta}\n\n¿Querés reemplazarlo?", "Guardar como...",
+                                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+
                 try
                 {
-                    string ruta = dialogo.FileName;
                     switch (formato)
                     {
-                        case "csv": File.WriteAllText(ruta, ATexto(tabla, ';', true), new UTF8Encoding(true)); break;
+                        case "csv":
+                            string cabecera = CSV_FORZAR_EXCEL ? "sep=" + SEPARADOR_CSV + Environment.NewLine : "";
+                            File.WriteAllText(ruta, cabecera + ATexto(tabla, SEPARADOR_CSV, true), new UTF8Encoding(true));
+                            break;
                         case "txt": File.WriteAllText(ruta, ATexto(tabla, '\t', false), new UTF8Encoding(true)); break;
                         case "json": File.WriteAllText(ruta, AJson(tabla), new UTF8Encoding(false)); break;
-                        case "html": File.WriteAllText(ruta, AHtml(tabla), new UTF8Encoding(false)); break;
-                        case "pdf": GuardarPdf(tabla, ruta); break;
+                        case "html": File.WriteAllText(ruta, AHtml(tabla, tituloDocumento), new UTF8Encoding(false)); break;
+                        case "pdf": GuardarPdf(tabla, ruta, tituloDocumento); break;
                         case "xml":
                             DataTable copia = tabla.Copy();
-                            copia.TableName = "Alumnos";
+                            copia.TableName = nombreXml;
                             copia.WriteXml(ruta, XmlWriteMode.IgnoreSchema);
                             break;
                     }
 
-                    LogMensaje($"[OK] Grilla exportada a: {ruta}");
+                    LogMensaje($"[OK] Exportado ({formato.ToUpper()}) a: {ruta}");
                     MessageBox.Show($"Archivo guardado correctamente en:\n{ruta}", "Guardar como...",
                                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
@@ -179,7 +220,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
         }
 
         // Escribe un PDF a mano (sin librerías): A4 horizontal, fuente Helvetica, tabla con paginado.
-        private static void GuardarPdf(DataTable tabla, string ruta)
+        private static void GuardarPdf(DataTable tabla, string ruta, string titulo)
         {
             CultureInfo inv = CultureInfo.InvariantCulture; // los decimales del PDF deben usar punto, no coma
             const float ancho = 842f, alto = 595f, margen = 36f;
@@ -212,7 +253,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             for (int pag = 0; pag < totalPaginas; pag++)
             {
                 StringBuilder s = new StringBuilder();
-                s.Append($"0 g BT /F2 14 Tf {margen.ToString(inv)} {(alto - margen - 14).ToString(inv)} Td ({PdfTexto("FaceTrack Attendance - Registro de asistencia", 90)}) Tj ET\n");
+                s.Append($"0 g BT /F2 14 Tf {margen.ToString(inv)} {(alto - margen - 14).ToString(inv)} Td ({PdfTexto(titulo, 90)}) Tj ET\n");
                 s.Append($"0.4 g BT /F1 8 Tf {margen.ToString(inv)} {(alto - margen - 28).ToString(inv)} Td ({PdfTexto($"Generado: {DateTime.Now:yyyy-MM-dd HH:mm}   |   Página {pag + 1} de {totalPaginas}   |   Total: {tabla.Rows.Count}", 120)}) Tj ET\n");
 
                 float yTop = alto - margen - 45f;
@@ -299,13 +340,13 @@ namespace Proyecto_ReconocimientoFacial_0._1
             return sb.ToString();
         }
 
-        private static string AHtml(DataTable tabla)
+        private static string AHtml(DataTable tabla, string titulo)
         {
             StringBuilder sb = new StringBuilder();
-            sb.AppendLine("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Asistencia</title>");
+            sb.AppendLine("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>" + WebUtility.HtmlEncode(titulo) + "</title>");
             sb.AppendLine("<style>body{font-family:Segoe UI,Arial;margin:24px}table{border-collapse:collapse}" +
                           "th,td{border:1px solid #999;padding:6px 12px;text-align:left}th{background:#222;color:#fff}</style>");
-            sb.AppendLine("</head><body><h2>FaceTrack Attendance</h2><table><tr>");
+            sb.AppendLine("</head><body><h2>" + WebUtility.HtmlEncode(titulo) + "</h2><table><tr>");
             foreach (DataColumn col in tabla.Columns)
                 sb.Append("<th>").Append(WebUtility.HtmlEncode(col.ColumnName)).Append("</th>");
             sb.AppendLine("</tr>");
