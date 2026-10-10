@@ -5,7 +5,7 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Linq;
 using System.Windows.Forms;
-
+using System.Runtime.InteropServices;
 
 namespace Proyecto_ReconocimientoFacial_0._1
 {
@@ -23,6 +23,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
         public static readonly Color ColorConsolaFondo = Color.FromArgb(20, 8, 28);      // Púrpura casi negro
         public static readonly Color ColorConsolaTexto = Color.FromArgb(255, 180, 140);   // Naranja suave
         public static readonly Color ColorBorde = Color.FromArgb(135, 45, 120);          // Borde Fucsia brillante
+        public static readonly Color ColorMarcoVentana = Color.FromArgb(95, 30, 95);     // Violeta oscuro: barra de título y borde de la ventana
+
         // ------------------------------------------------------------------
         // ESTILO GENERAL (se aplica recorriendo TODOS los controles, también los anidados)
         // ------------------------------------------------------------------
@@ -31,7 +33,47 @@ namespace Proyecto_ReconocimientoFacial_0._1
             formulario.BackColor = ColorFondo;
             formulario.Font = new Font("Segoe UI", 9f);
             AplicarEstiloRecursivo(formulario.Controls);
+            AplicarMarcoVentana(formulario);   // <- NUEVA
         }
+
+        // ------------------------------------------------------------------
+        // MARCO DE LA VENTANA (barra de título + borde)
+        // ------------------------------------------------------------------
+        // Lo dibuja Windows, no WinForms, así que se pide al DWM. Funciona en Windows 11;
+        // en Windows 10 se ignora y queda el marco normal (no da error).
+        [DllImport("dwmapi.dll", PreserveSig = true)]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int atributo, ref int valor, int tamano);
+
+        private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20; // botones minimizar/maximizar/cerrar en claro
+        private const int DWMWA_BORDER_COLOR = 34;
+        private const int DWMWA_CAPTION_COLOR = 35;
+        private const int DWMWA_TEXT_COLOR = 36;
+
+        public static void AplicarMarcoVentana(Form formulario)
+        {
+            // AplicarEstilo corre en el constructor, cuando la ventana todavía no existe: se espera a que se cree.
+            formulario.HandleCreated += (s, e) => PintarMarco(formulario);
+            if (formulario.IsHandleCreated) PintarMarco(formulario);
+        }
+
+        private static void PintarMarco(Form formulario)
+        {
+            try
+            {
+                int oscuro = 1;
+                int fondo = ColorARef(ColorMarcoVentana);
+                int borde = fondo;
+                int texto = ColorARef(ColorTextoClaro);
+
+                DwmSetWindowAttribute(formulario.Handle, DWMWA_USE_IMMERSIVE_DARK_MODE, ref oscuro, sizeof(int));
+                DwmSetWindowAttribute(formulario.Handle, DWMWA_CAPTION_COLOR, ref fondo, sizeof(int));
+                DwmSetWindowAttribute(formulario.Handle, DWMWA_BORDER_COLOR, ref borde, sizeof(int));
+                DwmSetWindowAttribute(formulario.Handle, DWMWA_TEXT_COLOR, ref texto, sizeof(int));
+            }
+            catch { /* Windows anterior a 11: se ignora */ }
+        }
+
+        private static int ColorARef(Color c) { return c.R | (c.G << 8) | (c.B << 16); } // Windows usa orden BGR
 
         // IMPORTANTE: en este switch los tipos más específicos van ANTES que los generales
         // (PanelRedondeado y TableLayoutPanel antes que Panel), si no el compilador da error CS8120.
