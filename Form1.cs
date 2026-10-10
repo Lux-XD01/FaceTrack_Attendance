@@ -1885,7 +1885,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 {
                     byte[] plantillaBytes = VectorABytes(ValoresDeMat(centroide));
                     // Inserta con un nombre provisorio y en la misma operación lo renombra a "Sujeto {Id real}"
-                    nueva.IdBd = administradorSQL.InsertarSujetoAutomatico(plantillaBytes);
+                    nueva.IdBd = administradorSQL.InsertarSujetoAutomatico(plantillaBytes, EstadoBaseHoy());
                     nueva.Id = nueva.IdBd.Value;
                     nueva.Nombre = $"Sujeto {nueva.IdBd.Value}";
                 }
@@ -1985,6 +1985,20 @@ namespace Proyecto_ReconocimientoFacial_0._1
         }
 
         #region HORARIOS
+        private volatile bool horariosCargados = false; // evita borrar estados si los horarios no se pudieron leer
+
+        private bool HayHorarioHoy()
+        {
+            HorarioDia h = gestorHorarios.Obtener(DateTime.Now.DayOfWeek);
+            return h != null && !h.EstaVacio;
+        }
+
+        // Estado "de fábrica" de hoy: "Ausente" si hay clases, vacío si no hay
+        private string EstadoBaseHoy()
+        {
+            return HayHorarioHoy() ? "Ausente" : "";
+        }
+
         private void LogEstadoMemoria()
         {
             int total = listaPersonas.Count;
@@ -2031,20 +2045,28 @@ namespace Proyecto_ReconocimientoFacial_0._1
         // Reinicio diario: se ejecuta al iniciar y cada vez que el reloj cambia de día
         private void ReiniciarEstadosVencidos()
         {
-            if (!sqlDisponible) return;
+            if (!sqlDisponible || !horariosCargados) return;
             DateTime hoy = DateTime.Today;
             if (fechaUltimoReinicio == hoy) return;
             fechaUltimoReinicio = hoy;
+
+            bool hayHorario = HayHorarioHoy();
 
             Task.Run(() =>
             {
                 try
                 {
-                    int n = administradorSQL.ReiniciarEstadosVencidos();
+                    // Hoy hay clases: solo se limpian fichajes de días anteriores.
+                    // Hoy NO hay clases: se limpia todo (nadie debería figurar presente ni ausente).
+                    int n = hayHorario
+                        ? administradorSQL.ReiniciarEstadosVencidos("Ausente")
+                        : administradorSQL.ReiniciarTodosLosEstados("");
+
                     if (n > 0)
                     {
-                        ultimoSujetoNotificado = "";   // para que quien esté frente a la cámara vuelva a fichar
-                        LogBiometria($"[{DateTime.Now:dd/MM/yyyy HH:mm:ss}] Nuevo día: {n} estado(s) reiniciado(s) a Ausente.");
+                        ultimoSujetoNotificado = "";
+                        LogBiometria($"[{DateTime.Now:dd/MM/yyyy HH:mm:ss}] Nuevo día: {n} estado(s) reiniciado(s)" +
+                                     (hayHorario ? " a Ausente." : " (hoy no hay horario: sin estado)."));
                         ActualizarGrilla();
                     }
                 }
@@ -2060,13 +2082,17 @@ namespace Proyecto_ReconocimientoFacial_0._1
         private void ReiniciarAsistenciaPorCambioDeHorario()
         {
             if (!sqlDisponible) return;
+            bool hayHorario = HayHorarioHoy();
+            string estadoBase = hayHorario ? "Ausente" : "";
+
             Task.Run(() =>
             {
                 try
                 {
-                    int n = administradorSQL.ReiniciarTodosLosEstados();
+                    int n = administradorSQL.ReiniciarTodosLosEstados(estadoBase);
                     ultimoSujetoNotificado = "";
-                    LogBiometria($"[{DateTime.Now:dd/MM/yyyy HH:mm:ss}] Horario modificado: {n} estado(s) reiniciado(s) a Ausente.");
+                    LogBiometria($"[{DateTime.Now:dd/MM/yyyy HH:mm:ss}] Horario modificado: {n} estado(s) reiniciado(s)" +
+                                 (hayHorario ? " a Ausente." : " (hoy no hay horario: sin estado)."));
                     ActualizarGrilla();
                 }
                 catch (Exception ex)
@@ -2075,6 +2101,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 }
             });
         }
+
         private static readonly string[] DIAS_NOMBRES = { "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo" };
         private static readonly DayOfWeek[] DIAS_ORDEN =
         {
@@ -2119,13 +2146,15 @@ namespace Proyecto_ReconocimientoFacial_0._1
             try
             {
                 gestorHorarios.Reemplazar(administradorSQL.ObtenerHorarios());
+                horariosCargados = true;
                 LogMensaje("[OK] Horarios cargados desde SQL Server.");
             }
             catch (Exception ex)
             {
                 LogMensaje($"[AVISO] No se pudieron leer los horarios: {ex.Message}");
             }
-            ReiniciarEstadosVencidos(); // al iniciar el programa también se limpian los estados de días anteriores
+
+            ReiniciarEstadosVencidos(); // al iniciar: limpia fichajes viejos o erróneos según el horario de hoy
             EjecutarEnUI(() => { CargarCamposHorarioDelDia(); ActualizarIndicadorHorario(); RefrescarPestanaHorario(); });
         }
 

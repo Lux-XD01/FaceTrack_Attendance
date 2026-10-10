@@ -55,8 +55,9 @@ namespace Proyecto_ReconocimientoFacial_0._1
             switch (Estado)
             {
                 case EstadoFichaje.Presente:
+                    return nombre + " está presente";
                 case EstadoFichaje.SinHorario:
-                    return Permitido ? nombre + " está presente" : Descripcion;
+                    return "Hoy no hay clases programadas";
                 case EstadoFichaje.LlegadaTarde:
                     return nombre + ": llegada tarde registrada";
                 case EstadoFichaje.LlegadaTardia:
@@ -80,10 +81,6 @@ namespace Proyecto_ReconocimientoFacial_0._1
         // Como 15 % < 85 % siempre, los tramos nunca se pisan, sea la clase larga o corta.
         public const double PORCENTAJE_PRESENTE = 0.15;
         public const double PORCENTAJE_LIMITE_TARDE = 0.85;
-
-        // false = si hoy no hay horario cargado, se sigue fichando como siempre (como antes de agregar
-        //         esta función). true = sin horario no se puede fichar.
-        public bool BloquearSinHorario { get; set; } = false;
 
         private volatile Dictionary<DayOfWeek, HorarioDia> horarios = new Dictionary<DayOfWeek, HorarioDia>();
 
@@ -117,13 +114,14 @@ namespace Proyecto_ReconocimientoFacial_0._1
         {
             HorarioDia h = Obtener(ahora.DayOfWeek);
 
-            if (h == null || h.EstaVacio)
-            {
+            if(h == null || h.EstaVacio)
+{
+                // Sin horario hoy: NO se marca nada (ni estado ni hora)
                 return new ResultadoFichaje
                 {
                     Estado = EstadoFichaje.SinHorario,
-                    Permitido = !BloquearSinHorario,
-                    TextoSql = BloquearSinHorario ? null : "Presente",
+                    Permitido = false,
+                    TextoSql = null,
                     Descripcion = "Sin horario configurado para hoy"
                 };
             }

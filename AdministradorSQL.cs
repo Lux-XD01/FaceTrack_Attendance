@@ -90,7 +90,8 @@ END";
         // tampoco se repite jamás, a diferencia de un contador manual que sí se puede reciclar.
         // Se hace en una transacción: primero se inserta con un nombre provisorio (para obtener el Id),
         // y en la misma transacción se corrige el nombre con ese Id ya conocido.
-        public int InsertarSujetoAutomatico(byte[] plantilla)
+
+        public int InsertarSujetoAutomatico(byte[] plantilla, string estadoInicial = "Ausente")
         {
             using (SqlConnection cn = new SqlConnection(cadenaConexion))
             {
@@ -99,9 +100,10 @@ END";
                 {
                     int id;
                     using (SqlCommand cmdInsert = new SqlCommand(
-                        "INSERT INTO Alumnos (Nombre, Estado, Plantilla) OUTPUT INSERTED.Id VALUES ('(pendiente)', 'Ausente', @Plantilla)",
+                        "INSERT INTO Alumnos (Nombre, Estado, Plantilla) OUTPUT INSERTED.Id VALUES ('(pendiente)', @Estado, @Plantilla)",
                         cn, tx))
                     {
+                        cmdInsert.Parameters.AddWithValue("@Estado", estadoInicial ?? "Ausente");
                         cmdInsert.Parameters.AddWithValue("@Plantilla", plantilla);
                         id = (int)cmdInsert.ExecuteScalar();
                     }
@@ -314,31 +316,32 @@ WHERE Id = @Id
             }
         }
 
-
-        // Reinicio por día nuevo: pone en "Ausente" a quien tenga un fichaje de un día anterior.
-        public int ReiniciarEstadosVencidos()
+        // Día nuevo: deja en estadoBase a quien tenga un fichaje de un día anterior (o un estado distinto sin fichaje)
+        public int ReiniciarEstadosVencidos(string estadoBase)
         {
             const string sql = @"
-UPDATE Alumnos SET Estado = 'Ausente', FechaHora = NULL
-WHERE Estado <> 'Ausente'
+UPDATE Alumnos SET Estado = @Base, FechaHora = NULL
+WHERE (Estado <> @Base OR FechaHora IS NOT NULL)
   AND (FechaHora IS NULL OR CAST(FechaHora AS DATE) < CAST(GETDATE() AS DATE))";
             using (SqlConnection cn = new SqlConnection(cadenaConexion))
             using (SqlCommand cmd = new SqlCommand(sql, cn))
             {
+                cmd.Parameters.AddWithValue("@Base", estadoBase ?? "");
                 cn.Open();
                 return cmd.ExecuteNonQuery();
             }
         }
 
-        // Reinicio por cambio de horario: TODOS vuelven a "Ausente" sin importar la hora en que ficharon.
-        public int ReiniciarTodosLosEstados()
+        // Cambio de horario (o día sin horario): TODOS vuelven a estadoBase, sin importar cuándo ficharon
+        public int ReiniciarTodosLosEstados(string estadoBase)
         {
             const string sql = @"
-UPDATE Alumnos SET Estado = 'Ausente', FechaHora = NULL
-WHERE Estado <> 'Ausente' OR FechaHora IS NOT NULL";
+UPDATE Alumnos SET Estado = @Base, FechaHora = NULL
+WHERE Estado <> @Base OR FechaHora IS NOT NULL";
             using (SqlConnection cn = new SqlConnection(cadenaConexion))
             using (SqlCommand cmd = new SqlCommand(sql, cn))
             {
+                cmd.Parameters.AddWithValue("@Base", estadoBase ?? "");
                 cn.Open();
                 return cmd.ExecuteNonQuery();
             }
