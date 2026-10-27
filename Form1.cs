@@ -45,6 +45,7 @@ using System.Net.NetworkInformation;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using System.Net.Sockets;
 
 namespace Proyecto_ReconocimientoFacial_0._1
 {
@@ -113,12 +114,11 @@ namespace Proyecto_ReconocimientoFacial_0._1
         private const string MSG_POCA_LUZ = "Falta luz: ilumine su rostro de frente"; //funciona
         private const string MSG_MUCHA_LUZ = "Demasiada luz directa sobre su rostro"; //funciona
         private const string MSG_LUZ_LATERAL = "Luz de costado: póngase de frente a la luz"; //funciona
-
-        // Cámara ESP32 - debe coincidir EXACTO con la IP fija que pusiste en el .ino (local_IP).
-        // Si volvés a cambiar la IP fija en el firmware, actualizala también acá.
-        private readonly string ipCamara = "192.168.1.100";
-        private readonly string streamUrl;
-        private readonly string tempUrl;
+                
+        private volatile string ipCamara = "";            // se descubre sola por beacon UDP
+        private const int PUERTO_DESCUBRIMIENTO = 4210;   // igual que PUERTO_BEACON del .ino
+        private const string FIRMA_BEACON = "FACETRACK|XIAO01";
+        
         private readonly TimeSpan intervaloTemp = TimeSpan.FromSeconds(20);
         private const double TEMP_ADVERTENCIA_C = 70.0;
 
@@ -248,10 +248,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             InitializeComponent();
 
             ConstruirInterfaz(); // se encarga de enganchar eventos y aplicar estilo a los controles
-
-            streamUrl = $"http://{ipCamara}:81/stream";
-            tempUrl = $"http://{ipCamara}/temp";
-
+                      
             this.Load += Form1_Load;
             this.FormClosing += Form1_FormClosing;
 
@@ -339,28 +336,9 @@ namespace Proyecto_ReconocimientoFacial_0._1
             InicializarSql();
             LogEstadoMemoria();
 
-            // El ping es solo informativo y no bloquea la interfaz ni impide conectar
-            Task.Run(() =>
-            {
-                try
-                {
-                    using (Ping ping = new Ping())
-                    {
-                        PingReply reply = ping.Send(ipCamara, 2000);
-                        if (reply != null && reply.Status == IPStatus.Success)
-                            LogMensaje($"[OK] Ping exitoso a {ipCamara} ({reply.RoundtripTime} ms).");
-                        else
-                            LogMensaje($"[AVISO] Sin respuesta al ping de {ipCamara} (se intentará conectar igual).");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    LogMensaje($"[AVISO] Ping falló: {ex.Message}");
-                }
-            });
-
-            LogMensaje($"Conectando a {streamUrl} ...");
+            LogMensaje("Buscando la cámara en la red...");
             IniciarStreamCamara();
+            IniciarDescubrimientoCamara();   
             IniciarSondeoTemperatura();
             IniciarMonitorConexion();
         }
@@ -753,7 +731,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
         // todavía, esto lo detecta igual porque mide cuánto hace que NO llega un fotograma nuevo.
         private void IniciarMonitorConexion()
         {
-            lblIP.Text = $"IP: {ipCamara}";
+            lblIP.Text = "IP: buscando cámara...";
             Estetica.EstilizarIndicadorConexion(lblIndicadorConexion);
             lblIndicadorConexion.ForeColor = Estetica.ColorPeligro;
             lblEstadoConexion.Text = "Desconectado";
@@ -761,6 +739,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             timerEstadoConexion = new System.Windows.Forms.Timer { Interval = 2000 };
             timerEstadoConexion.Tick += (s, e) =>
             {
+                lblIP.Text = string.IsNullOrEmpty(ipCamara) ? "IP: buscando cámara..." : $"IP: {ipCamara}";
                 bool conectado = ultimoFrameRecibido != DateTime.MinValue &&
                                  (DateTime.Now - ultimoFrameRecibido) < TimeSpan.FromSeconds(5);
 
@@ -853,11 +832,50 @@ namespace Proyecto_ReconocimientoFacial_0._1
             }, token);
         }
 
+        private void IniciarDescubrimientoCamara()
+        {
+            CancellationToken token = cancellationTokenSource.Token;
+
+            Task.Run(() =>
+            {
+                UdpClient udp = null;
+                try
+                {
+                    udp = new UdpClient();
+                    udp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                    udp.Client.Bind(new IPEndPoint(IPAddress.Any, PUERTO_DESCUBRIMIENTO));
+                    token.Register(() => { try { udp.Close(); } catch { } });
+
+                    IPEndPoint remoto = new IPEndPoint(IPAddress.Any, 0);
+                    while (!token.IsCancellationRequested && !isDisposing)
+                    {
+                        byte[] datos = udp.Receive(ref remoto);
+                        if (Encoding.ASCII.GetString(datos) != FIRMA_BEACON) continue;
+
+                        string nuevaIp = remoto.Address.ToString();
+                        if (nuevaIp != ipCamara)
+                        {
+                            ipCamara = nuevaIp;
+                            LogMensaje($"[DESCUBRIMIENTO] Cámara encontrada en {nuevaIp}.");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (!token.IsCancellationRequested && !isDisposing)
+                        LogMensaje($"[DESCUBRIMIENTO] Error: {ex.Message}");
+                }
+                finally { udp?.Close(); }
+            }, token);
+        }
+
         private async Task ConsultarTemperaturaEsp32()
         {
             try
             {
-                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(tempUrl);
+                string ip = ipCamara;
+                if (string.IsNullOrEmpty(ip)) return;
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create($"http://{ip}/temp");
                 request.Timeout = 3000;
                 request.Method = "GET";
 
@@ -903,15 +921,15 @@ namespace Proyecto_ReconocimientoFacial_0._1
             cancellationTokenSource = new CancellationTokenSource();
             CancellationToken token = cancellationTokenSource.Token;
 
-            Task.Factory.StartNew(() => CaptureMjpegStream(streamUrl, token), token,
-                                  TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            Task.Factory.StartNew(() => CaptureMjpegStream(token), token,
+                      TaskCreationOptions.LongRunning, TaskScheduler.Default);
             Task.Factory.StartNew(() => BucleProcesamiento(token), token,
                                   TaskCreationOptions.LongRunning, TaskScheduler.Default);
             Task.Factory.StartNew(() => BucleVisualizacion(token), token,
                       TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
-        private void CaptureMjpegStream(string url, CancellationToken token)
+        private void CaptureMjpegStream(CancellationToken token)
         {
             byte[] buffer = new byte[1024 * 512];
 
@@ -923,7 +941,9 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
                 try
                 {
-                    request = (HttpWebRequest)WebRequest.Create(url);
+                    string ip = ipCamara;
+                    if (string.IsNullOrEmpty(ip)) { token.WaitHandle.WaitOne(500); continue; }  // aún no se descubrió
+                    request = (HttpWebRequest)WebRequest.Create($"http://{ip}:81/stream");
                     request.Timeout = 5000;
                     request.ReadWriteTimeout = 8000;   // si la ESP32 se cuelga, se reconecta en vez de bloquearse para siempre
                     request.KeepAlive = false;
