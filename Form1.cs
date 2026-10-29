@@ -1402,6 +1402,18 @@ namespace Proyecto_ReconocimientoFacial_0._1
 
                 ResultadoFichaje fichaje = conocido ? gestorHorarios.Evaluar(DateTime.Now) : null;
 
+                // Lo que se MUESTRA: si ya fichó hoy, el resultado de su PRIMERA llegada (guardado en SQL);
+                // si todavía no fichó, el que corresponde a la hora actual.
+                // "fichaje" no se modifica: es el que se usa para GUARDAR más abajo.
+                ResultadoFichaje fichajeMostrar = fichaje;
+                if (conocido)
+                {
+                    PersonaRegistrada personaPie = listaPersonas.FirstOrDefault(p => p.Nombre == identidad);
+                    string estadoGuardado;
+                    if (YaRegistradoHoyEnCache(personaPie?.IdBd, out estadoGuardado))
+                        fichajeMostrar = FichajeDesdeEstadoGuardado(estadoGuardado);
+                }
+
                 // Mensaje al pie de la imagen
                 if (analizando)
                 {
@@ -1410,13 +1422,13 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 }
                 else if (conocido)
                 {
-                    pieEstadoTexto = fichaje.MensajePantalla(identidad);
-                    pieEstadoColor = fichaje.Estado == EstadoFichaje.LlegadaTarde ? COLOR_AMARILLO
-                                   : fichaje.Permitido ? COLOR_VERDE : COLOR_ROJO;
+                    pieEstadoTexto = fichajeMostrar.MensajePantalla(identidad);
+                    pieEstadoColor = fichajeMostrar.Estado == EstadoFichaje.LlegadaTarde ? COLOR_AMARILLO
+                                   : fichajeMostrar.Permitido ? COLOR_VERDE : COLOR_ROJO;
                 }
                 else
                 {
-                    pieEstadoTexto = "Desconocido: no está registrado en el sistema"; 
+                    pieEstadoTexto = "Desconocido: no está registrado en el sistema";
                     pieEstadoColor = COLOR_ROJO;
                 }
 
@@ -1436,20 +1448,40 @@ namespace Proyecto_ReconocimientoFacial_0._1
                         ultimoSujetoNotificado = identidad;
                         ultimaNotificacion = DateTime.Now;
 
-                        // Marca presente en SQL fuera del lock: la latencia de red no debe frenar el video.
-                        if (sqlDisponible && conocido && fichaje.Permitido)
+                        // Consulta/guardado en SQL fuera del lock: la latencia de red no debe frenar el video.
+                        if (sqlDisponible && conocido)
                         {
                             PersonaRegistrada persona = listaPersonas.FirstOrDefault(p => p.Nombre == identidad);
                             if (persona?.IdBd != null)
                             {
                                 int idParaSql = persona.IdBd.Value;
+                                bool puedeMarcar = fichaje.Permitido;   // se captura ahora: la hora sigue corriendo
                                 string estadoSql = fichaje.TextoSql;
                                 Task.Run(() =>
                                 {
                                     try
                                     {
+                                        // 1) Consultar SQL: ¿ya tiene asistencia registrada hoy?
+                                        string estadoPrevio;
+                                        DateTime fechaPrevia;
+                                        if (administradorSQL.ObtenerAsistenciaDeHoy(idParaSql, out estadoPrevio, out fechaPrevia))
+                                        {
+                                            // 3) Sí: se ignora el nuevo ingreso. La pantalla sigue mostrando el mensaje de su primera llegada.
+                                            GuardarEnCacheRegistroHoy(idParaSql, estadoPrevio, fechaPrevia);
+                                            return;
+                                        }
+
+                                        // No hay registro hoy: si la caché tenía algo, quedó vieja.
+                                        QuitarDeCacheRegistroHoy(idParaSql);
+
+                                        // 2) Sin registro hoy: si el horario lo permite, se guarda el estado según la hora actual.
+                                        if (!puedeMarcar) return;
+
                                         if (administradorSQL.MarcarAsistencia(idParaSql, estadoSql))
+                                        {
+                                            GuardarEnCacheRegistroHoy(idParaSql, estadoSql, DateTime.Now);
                                             LogBiometria($"[{DateTime.Now:dd/MM/yyyy HH:mm:ss}] {identidad}: {estadoSql}");
+                                        }
                                         ActualizarGrilla();
                                     }
                                     catch (Exception ex)
@@ -1462,6 +1494,56 @@ namespace Proyecto_ReconocimientoFacial_0._1
                     }
                 }
             }
+        }
+
+        // ------------------------------------------------------------------
+        // ASISTENCIA DE HOY (caché)
+        // ------------------------------------------------------------------
+        // Sirve solo para que el mensaje del pie responda al instante, sin ir a SQL en cada fotograma.
+        // La verdad es SQL: se vuelve a consultar cada vez que corre el cooldown de 5 s.
+        private readonly object lockRegistroHoy = new object();
+        private readonly Dictionary<int, (string Estado, DateTime Fecha)> registroHoy =
+            new Dictionary<int, (string Estado, DateTime Fecha)>();
+
+        private bool YaRegistradoHoyEnCache(int? idPersona, out string estado)
+        {
+            estado = null;
+            if (idPersona == null) return false;
+
+            lock (lockRegistroHoy)
+            {
+                if (registroHoy.TryGetValue(idPersona.Value, out var registro) && registro.Fecha.Date == DateTime.Today)
+                {
+                    estado = registro.Estado;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private void GuardarEnCacheRegistroHoy(int id, string estado, DateTime fecha)
+        {
+            lock (lockRegistroHoy) registroHoy[id] = (estado, fecha);
+        }
+
+
+        private void QuitarDeCacheRegistroHoy(int id)
+        {
+            lock (lockRegistroHoy) registroHoy.Remove(id);
+        }
+
+        // Reconstruye el resultado de la PRIMERA llegada a partir del estado guardado en SQL.
+        // El sistema solo guarda dos textos ("Presente" y "Llegada tarde", ver GestorHorarios.Evaluar),
+        // así que con eso se recuperan el mensaje y el color originales.
+        private static ResultadoFichaje FichajeDesdeEstadoGuardado(string estadoGuardado)
+        {
+            bool tarde = string.Equals(estadoGuardado, "Llegada tarde", StringComparison.OrdinalIgnoreCase);
+            return new ResultadoFichaje
+            {
+                Estado = tarde ? EstadoFichaje.LlegadaTarde : EstadoFichaje.Presente,
+                Permitido = true,
+                TextoSql = estadoGuardado
+            };
         }
 
         // ------------------------------------------------------------------
@@ -2135,6 +2217,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
                     if (n > 0)
                     {
                         ultimoSujetoNotificado = "";
+                        lock (lockRegistroHoy) registroHoy.Clear();
+
                         LogBiometria($"[{DateTime.Now:dd/MM/yyyy HH:mm:ss}] Nuevo día: {n} estado(s) reiniciado(s)" +
                                      (hayHorario ? " a Ausente." : " (hoy no hay horario: sin estado)."));
                         ActualizarGrilla();
@@ -2161,6 +2245,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
                 {
                     int n = administradorSQL.ReiniciarTodosLosEstados(estadoBase);
                     ultimoSujetoNotificado = "";
+                    lock (lockRegistroHoy) registroHoy.Clear();
+
                     LogBiometria($"[{DateTime.Now:dd/MM/yyyy HH:mm:ss}] Horario modificado: {n} estado(s) reiniciado(s)" +
                                  (hayHorario ? " a Ausente." : " (hoy no hay horario: sin estado)."));
                     ActualizarGrilla();

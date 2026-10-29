@@ -316,6 +316,37 @@ WHERE Id = @Id
             }
         }
 
+        // ¿Esta persona ya fichó HOY? Devuelve true y el estado/hora guardados si sí.
+        // Es el complemento exacto de la condición de MarcarAsistencia (Estado <> 'Ausente' y FechaHora de hoy).
+        public bool ObtenerAsistenciaDeHoy(int id, out string estado, out DateTime fecha)
+        {
+            const string sql = @"
+SELECT Estado, FechaHora FROM Alumnos
+WHERE Id = @Id
+  AND Estado <> 'Ausente'
+  AND FechaHora >= @Hoy AND FechaHora < @Manana";
+
+            estado = null;
+            fecha = DateTime.MinValue;
+
+            using (SqlConnection cn = new SqlConnection(cadenaConexion))
+            using (SqlCommand cmd = new SqlCommand(sql, cn))
+            {
+                DateTime hoy = DateTime.Today;
+                cmd.Parameters.AddWithValue("@Id", id);
+                cmd.Parameters.AddWithValue("@Hoy", hoy);
+                cmd.Parameters.AddWithValue("@Manana", hoy.AddDays(1));
+                cn.Open();
+                using (SqlDataReader lector = cmd.ExecuteReader())
+                {
+                    if (!lector.Read()) return false;
+                    estado = lector.GetString(0);
+                    fecha = lector.GetDateTime(1);
+                    return true;
+                }
+            }
+        }
+
         // Día nuevo: deja en estadoBase a quien tenga un fichaje de un día anterior (o un estado distinto sin fichaje)
         public int ReiniciarEstadosVencidos(string estadoBase)
         {
