@@ -118,7 +118,9 @@ namespace Proyecto_ReconocimientoFacial_0._1
         private volatile string ipCamara = "";            // se descubre sola por beacon UDP
         private const int PUERTO_DESCUBRIMIENTO = 4210;   // igual que PUERTO_BEACON del .ino
         private const string FIRMA_BEACON = "FACETRACK|XIAO01";
-        
+        private volatile string nombreRed = "";           // SSID que informa la cámara en el beacon
+        private volatile int rssiCamara = int.MinValue;   // dBm de la cámara; int.MinValue = desconocido
+
         private readonly TimeSpan intervaloTemp = TimeSpan.FromSeconds(20);
         private const double TEMP_ADVERTENCIA_C = 70.0;
 
@@ -731,22 +733,63 @@ namespace Proyecto_ReconocimientoFacial_0._1
         // todavía, esto lo detecta igual porque mide cuánto hace que NO llega un fotograma nuevo.
         private void IniciarMonitorConexion()
         {
-            lblIP.Text = "IP: buscando cámara...";
             Estetica.EstilizarIndicadorConexion(lblIndicadorConexion);
-            lblIndicadorConexion.ForeColor = Estetica.ColorPeligro;
-            lblEstadoConexion.Text = "Desconectado";
+            ActualizarPanelConexion();   // pinta el estado inicial: "Buscando dispositivo..."
 
-            timerEstadoConexion = new System.Windows.Forms.Timer { Interval = 2000 };
-            timerEstadoConexion.Tick += (s, e) =>
-            {
-                lblIP.Text = string.IsNullOrEmpty(ipCamara) ? "IP: buscando cámara..." : $"IP: {ipCamara}";
-                bool conectado = ultimoFrameRecibido != DateTime.MinValue &&
-                                 (DateTime.Now - ultimoFrameRecibido) < TimeSpan.FromSeconds(5);
-
-                lblIndicadorConexion.ForeColor = conectado ? Estetica.ColorExito : Estetica.ColorPeligro;
-                lblEstadoConexion.Text = conectado ? "Conectado" : "Desconectado";
-            };
+            timerEstadoConexion = new System.Windows.Forms.Timer { Interval = 1000 };
+            timerEstadoConexion.Tick += (s, e) => ActualizarPanelConexion();
             timerEstadoConexion.Start();
+        }
+
+        private void ActualizarPanelConexion()
+        {
+            bool conectado = ultimoFrameRecibido != DateTime.MinValue &&
+                             (DateTime.Now - ultimoFrameRecibido) < TimeSpan.FromSeconds(5);
+            bool nuncaConecto = ultimoFrameRecibido == DateTime.MinValue;
+
+            if (conectado)
+            {
+                lblIndicadorConexion.ForeColor = Estetica.ColorExito;
+                lblEstadoConexion.Text = "Conectado";
+            }
+            else if (nuncaConecto)   // todavía en la búsqueda inicial
+            {
+                lblIndicadorConexion.ForeColor = Estetica.ColorAdvertencia;
+                lblEstadoConexion.Text = string.IsNullOrEmpty(ipCamara) ? "Buscando dispositivo..."
+                                                                         : "Conectando a la red...";
+            }
+            else                     // ya había conectado y se perdieron los fotogramas
+            {
+                lblIndicadorConexion.ForeColor = Estetica.ColorPeligro;
+                lblEstadoConexion.Text = "Desconectado";
+            }
+
+            // Red y señal: solo se muestran con la cámara conectada
+            string red = nombreRed;
+            if (conectado && !string.IsNullOrEmpty(red))
+            {
+                if (red.Length > 18) red = red.Substring(0, 17) + "…";   // evita desbordar el panel
+                lblRed.Text = "Red: " + red;
+            }
+            else lblRed.Text = "Red: --";
+
+            int rssi = rssiCamara;
+            if (conectado && rssi != int.MinValue)
+            {
+                string calidad; int nivel;
+                if (rssi >= -55) { calidad = "Excelente"; nivel = 4; }
+                else if (rssi >= -67) { calidad = "Buena"; nivel = 3; }
+                else if (rssi >= -75) { calidad = "Regular"; nivel = 2; }
+                else { calidad = "Débil"; nivel = 1; }
+
+                lblSenal.Text = "Señal: " + calidad;
+                iconoWifi.Establecer(nivel);
+            }
+            else
+            {
+                lblSenal.Text = "Señal: --";
+                iconoWifi.Establecer(0);   // icono apagado
+            }
         }
 
         // ------------------------------------------------------------------
@@ -850,7 +893,13 @@ namespace Proyecto_ReconocimientoFacial_0._1
                     while (!token.IsCancellationRequested && !isDisposing)
                     {
                         byte[] datos = udp.Receive(ref remoto);
-                        if (Encoding.ASCII.GetString(datos) != FIRMA_BEACON) continue;
+                        string mensaje = Encoding.UTF8.GetString(datos);
+                        if (!mensaje.StartsWith(FIRMA_BEACON, StringComparison.Ordinal)) continue;
+
+                        // Formato: FACETRACK|XIAO01|<rssi>|<ssid>   (el SSID va al final por si contiene '|')
+                        string[] partes = mensaje.Split(new[] { '|' }, 4);
+                        rssiCamara = (partes.Length >= 3 && int.TryParse(partes[2], out int rssi)) ? rssi : int.MinValue;
+                        nombreRed = partes.Length >= 4 ? partes[3].Trim() : "";
 
                         string nuevaIp = remoto.Address.ToString();
                         if (nuevaIp != ipCamara)
@@ -859,6 +908,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                             LogMensaje($"[DESCUBRIMIENTO] Cámara encontrada en {nuevaIp}.");
                         }
                     }
+                
                 }
                 catch (Exception ex)
                 {

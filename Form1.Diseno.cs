@@ -27,6 +27,10 @@ namespace Proyecto_ReconocimientoFacial_0._1
 {
     public partial class Form1 : IMessageFilter
     {
+        private readonly Label lblRed = new Label { AutoSize = true, Text = "Red: --" };
+        private readonly Label lblSenal = new Label { AutoSize = true, Text = "Señal: --" };
+        private readonly IconoWifi iconoWifi = new IconoWifi();
+
         // ---- Panel de horarios ----
         private readonly GestorHorarios gestorHorarios = new GestorHorarios();
         private PanelRedondeado panelHorarios;
@@ -77,23 +81,31 @@ namespace Proyecto_ReconocimientoFacial_0._1
             panelConexion.Name = "panelConexion";
             panelConexion.Titulo = "ESTADO DE CONEXIÓN";
 
-            TableLayoutPanel conexion = NuevaTabla("layoutConexion", 3, 1);
-            conexion.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            conexion.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            conexion.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            TableLayoutPanel conexion = NuevaTabla("layoutConexion", 5, 1);
+            conexion.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));       // punto de color
+            conexion.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));       // Conectado / Buscando...
+            conexion.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));       // Red: ...
+            conexion.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));       // Señal: ...
+            conexion.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f)); // icono, pegado a la derecha
             conexion.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
-            foreach (Label etiqueta in new[] { lblIndicadorConexion, lblEstadoConexion, lblIP })
+            foreach (Label etiqueta in new[] { lblIndicadorConexion, lblEstadoConexion, lblRed, lblSenal })
             {
                 etiqueta.Anchor = AnchorStyles.Left;      // solo "Left": así se centra verticalmente en la celda
-                etiqueta.Margin = new Padding(8, 0, 8, 0);
+                etiqueta.Margin = new Padding(6, 0, 14, 0);
             }
             lblEstadoConexion.Font = new Font("Segoe UI", 12f, FontStyle.Bold);
-            lblIP.Font = new Font("Segoe UI", 11f);
+            lblRed.Font = new Font("Segoe UI", 11f);
+            lblSenal.Font = new Font("Segoe UI", 11f);
+
+            iconoWifi.Anchor = AnchorStyles.Right;
+            iconoWifi.Margin = new Padding(0);
 
             conexion.Controls.Add(lblIndicadorConexion, 0, 0);
             conexion.Controls.Add(lblEstadoConexion, 1, 0);
-            conexion.Controls.Add(lblIP, 2, 0);
+            conexion.Controls.Add(lblRed, 2, 0);
+            conexion.Controls.Add(lblSenal, 3, 0);
+            conexion.Controls.Add(iconoWifi, 4, 0);
             panelConexion.Controls.Add(conexion);
             izquierda.Controls.Add(panelConexion, 0, 2);
 

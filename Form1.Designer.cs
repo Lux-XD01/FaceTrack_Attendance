@@ -39,7 +39,6 @@
             this.btnGuardarEdiciones = new System.Windows.Forms.Button();
             this.btnEliminarSeleccionado = new System.Windows.Forms.Button();
             this.btnActualizarGrilla = new System.Windows.Forms.Button();
-            this.lblIP = new System.Windows.Forms.Label();
             this.lblIndicadorConexion = new System.Windows.Forms.Label();
             this.lblEstadoConexion = new System.Windows.Forms.Label();
             this.panelTemperatura = new System.Windows.Forms.Panel();
@@ -170,15 +169,7 @@
             this.btnActualizarGrilla.Text = "Actualizar";
             this.btnActualizarGrilla.UseVisualStyleBackColor = false;
             this.btnActualizarGrilla.Click += new System.EventHandler(this.btnActualizarGrilla_Click);
-            // 
-            // lblIP
-            // 
-            this.lblIP.AutoSize = true;
-            this.lblIP.Location = new System.Drawing.Point(73, 772);
-            this.lblIP.Name = "lblIP";
-            this.lblIP.Size = new System.Drawing.Size(44, 16);
-            this.lblIP.TabIndex = 12;
-            this.lblIP.Text = "label1";
+                        
             // 
             // lblIndicadorConexion
             // 
@@ -214,7 +205,6 @@
             this.Controls.Add(this.panelTemperatura);
             this.Controls.Add(this.lblEstadoConexion);
             this.Controls.Add(this.lblIndicadorConexion);
-            this.Controls.Add(this.lblIP);
             this.Controls.Add(this.dgvAlumnos);
             this.Controls.Add(this.btnActualizarGrilla);
             this.Controls.Add(this.btnEliminarSeleccionado);
@@ -249,7 +239,7 @@
         private System.Windows.Forms.Button btnGuardarEdiciones;
         private System.Windows.Forms.Button btnEliminarSeleccionado;
         private System.Windows.Forms.Button btnActualizarGrilla;
-        private System.Windows.Forms.Label lblIP;
+        
         private System.Windows.Forms.Label lblIndicadorConexion;
         private System.Windows.Forms.Label lblEstadoConexion;
         private System.Windows.Forms.Panel panelTemperatura;

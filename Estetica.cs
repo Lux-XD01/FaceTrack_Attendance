@@ -20,6 +20,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
         public static readonly Color ColorTextoClaro = Color.FromArgb(245, 230, 245);     // Blanco rosado
         public static readonly Color ColorPeligro = Color.FromArgb(215, 60, 75);         // Rojo coral
         public static readonly Color ColorExito = Color.FromArgb(60, 190, 110);          // Verde brillante
+        public static readonly Color ColorAdvertencia = Color.FromArgb(245, 200, 60);  // Amarillo: "buscando / conectando"
+        public static readonly Color ColorNeonVerde = Color.FromArgb(70, 255, 100);  // Verde neón del icono Wi-Fi
         public static readonly Color ColorConsolaFondo = Color.FromArgb(20, 8, 28);      // Púrpura casi negro
         public static readonly Color ColorConsolaTexto = Color.FromArgb(255, 180, 140);   // Naranja suave
         public static readonly Color ColorBorde = Color.FromArgb(135, 45, 120);          // Borde Fucsia brillante
@@ -399,6 +401,76 @@ namespace Proyecto_ReconocimientoFacial_0._1
             ruta.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
             ruta.CloseFigure();
             return ruta;
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // ICONO WI-FI (barras neón)
+    // ----------------------------------------------------------------------
+    public class IconoWifi : Control
+    {
+        private int nivel = 0;   // 0 = apagado | 1 = punto | 2 = +1 arco | 3 = +2 arcos | 4 = +3 arcos
+
+        public IconoWifi()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            Size = new Size(50, 38);
+            TabStop = false;
+        }
+
+        public void Establecer(int nuevoNivel)
+        {
+            nuevoNivel = Math.Max(0, Math.Min(4, nuevoNivel));
+            if (nuevoNivel == nivel) return;
+            nivel = nuevoNivel;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.Clear(Parent != null ? Parent.BackColor : Estetica.ColorPanel);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            float cx = Width / 2f;
+            float cy = Height - 6f;
+            float[] radios = { 11f, 20f, 29f };
+
+            for (int i = 0; i < radios.Length; i++)
+                DibujarArco(g, cx, cy, radios[i], nivel >= i + 2);
+
+            DibujarPunto(g, cx, cy, nivel >= 1);
+        }
+
+        private static Color Apagado { get { return Color.FromArgb(80, 70, 95); } }
+
+        private static void DibujarArco(Graphics g, float cx, float cy, float r, bool encendido)
+        {
+            RectangleF rect = new RectangleF(cx - r, cy - r, r * 2, r * 2);
+            if (encendido)
+            {
+                using (Pen glow = new Pen(Color.FromArgb(55, Estetica.ColorNeonVerde), 9f))
+                {
+                    glow.StartCap = glow.EndCap = LineCap.Round;
+                    g.DrawArc(glow, rect, -135f, 90f);
+                }
+            }
+            using (Pen lapiz = new Pen(encendido ? Estetica.ColorNeonVerde : Apagado, 4f))
+            {
+                lapiz.StartCap = lapiz.EndCap = LineCap.Round;
+                g.DrawArc(lapiz, rect, -135f, 90f);
+            }
+        }
+
+        private static void DibujarPunto(Graphics g, float cx, float cy, bool encendido)
+        {
+            if (encendido)
+                using (Brush glow = new SolidBrush(Color.FromArgb(55, Estetica.ColorNeonVerde)))
+                    g.FillEllipse(glow, cx - 6f, cy - 6f, 12f, 12f);
+
+            using (Brush b = new SolidBrush(encendido ? Estetica.ColorNeonVerde : Apagado))
+                g.FillEllipse(b, cx - 3.5f, cy - 3.5f, 7f, 7f);
         }
     }
 
