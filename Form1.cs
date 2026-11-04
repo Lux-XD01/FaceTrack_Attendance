@@ -270,6 +270,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
             // Esto queda en Form1 porque es parte de cómo se muestra el stream, no de la paleta visual.
             pictureBox1.SizeMode = PictureBoxSizeMode.Zoom;
             pictureBox1.BorderStyle = BorderStyle.FixedSingle;
+            pictureBox1.Paint += PictureBox1_Paint;
 
             // Enganchá estos métodos a los eventos Click de los botones desde el Designer
             // (o descomentá estas líneas si preferís engancharlos acá):
@@ -746,6 +747,8 @@ namespace Proyecto_ReconocimientoFacial_0._1
             bool conectado = ultimoFrameRecibido != DateTime.MinValue &&
                              (DateTime.Now - ultimoFrameRecibido) < TimeSpan.FromSeconds(5);
             bool nuncaConecto = ultimoFrameRecibido == DateTime.MinValue;
+            // Sin transmisión (nunca empezó o se cortó): negro + "No hay conexión" en vez del último fotograma
+            if (!conectado) MostrarSinConexion(true);
 
             if (conectado)
             {
@@ -2099,7 +2102,48 @@ namespace Proyecto_ReconocimientoFacial_0._1
         // ------------------------------------------------------------------
         // INTERFAZ
         // ------------------------------------------------------------------
-       
+
+        // ------------------------------------------------------------------
+        // PANTALLA "NO HAY CONEXIÓN"
+        // ------------------------------------------------------------------
+        // true = pictureBox1 muestra negro + texto en lugar del video.
+        // Empieza en true: antes de que llegue el primer fotograma tampoco hay transmisión.
+        // Solo se toca desde el hilo de la interfaz (Timer, Paint y el BeginInvoke de MostrarFrame).
+        private bool mostrandoSinConexion = true;
+
+        private void MostrarSinConexion(bool mostrar)
+        {
+            if (mostrandoSinConexion == mostrar) return;   // solo actúa cuando el estado cambia
+            mostrandoSinConexion = mostrar;
+
+            if (mostrar)
+            {
+                Image congelado = pictureBox1.Image;       // quita y libera el último fotograma
+                pictureBox1.Image = null;
+                congelado?.Dispose();
+            }
+            pictureBox1.Invalidate();
+        }
+
+        private void PictureBox1_Paint(object sender, PaintEventArgs e)
+        {
+            if (!mostrandoSinConexion) return;             // con video activo no dibuja nada extra
+
+            Graphics g = e.Graphics;
+            g.Clear(Color.Black);
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+            float tam = Math.Max(12f, pictureBox1.Height / 16f);   // el texto crece con el cuadro
+            using (Font fuente = new Font("Segoe UI", tam, FontStyle.Bold, GraphicsUnit.Point))
+            using (StringFormat centrado = new StringFormat
+            {
+                Alignment = StringAlignment.Center,
+                LineAlignment = StringAlignment.Center
+            })
+            using (Brush pincel = new SolidBrush(Color.Gainsboro))
+                g.DrawString("No hay conexión", fuente, pincel, pictureBox1.ClientRectangle, centrado);
+        }
+
         // Muestra el fotograma sin acumular bitmaps si la interfaz va más lenta que el procesamiento
         private void MostrarFrame(Mat frame, SuperposicionFrame sp)
         {
@@ -2119,6 +2163,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                     {
                         if (isDisposing || IsDisposed) { bmp.Dispose(); return; }
 
+                        mostrandoSinConexion = false;   // llegó un fotograma: se muestra el video
                         Image anterior = pictureBox1.Image;
                         pictureBox1.Image = bmp;
                         anterior?.Dispose();
