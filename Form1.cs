@@ -1001,6 +1001,7 @@ namespace Proyecto_ReconocimientoFacial_0._1
                     request.ReadWriteTimeout = 8000;   // si la ESP32 se cuelga, se reconecta en vez de bloquearse para siempre
                     request.KeepAlive = false;
                     request.AllowReadStreamBuffering = false;
+                    request.Proxy = null;   // evita la detección de proxy al conectar
 
                     HttpWebRequest reqLocal = request;
                     registro = token.Register(() => { try { reqLocal.Abort(); } catch { } }); // desbloquea Read() al cerrar
