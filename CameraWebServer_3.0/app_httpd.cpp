@@ -22,6 +22,7 @@
 #include "sdkconfig.h"
 #include "camera_index.h"
 #include "board_config.h"
+#include "lwip/sockets.h"
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -227,7 +228,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   esp_err_t res = ESP_OK;
   size_t _jpg_buf_len = 0;
   uint8_t *_jpg_buf = NULL;
-  char *part_buf[128];
+  char head_buf[192];
 
   static int64_t last_frame = 0;
   if (!last_frame) {
@@ -241,6 +242,9 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   httpd_resp_set_hdr(req, "X-Framerate", "60");
+  int sockfd = httpd_req_to_sockfd(req);
+  int nodelay = 1;
+  setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));  // sin retardo de Nagle
 
 #if defined(LED_GPIO_NUM)
   isStreaming = true;
@@ -269,11 +273,11 @@ static esp_err_t stream_handler(httpd_req_t *req) {
       }
     }
     if (res == ESP_OK) {
-      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-    }
-    if (res == ESP_OK) {
-      size_t hlen = snprintf((char *)part_buf, 128, _STREAM_PART, _jpg_buf_len, _timestamp.tv_sec, _timestamp.tv_usec);
-      res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+        size_t blen = strlen(_STREAM_BOUNDARY);
+        memcpy(head_buf, _STREAM_BOUNDARY, blen);
+        size_t hlen = blen + snprintf(head_buf + blen, sizeof(head_buf) - blen, _STREAM_PART,
+            (unsigned)_jpg_buf_len, (int)_timestamp.tv_sec, (int)_timestamp.tv_usec);
+        res = httpd_resp_send_chunk(req, head_buf, hlen);   // límite + cabecera en un solo envío
     }
     if (res == ESP_OK) {
       res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
@@ -687,6 +691,9 @@ static esp_err_t index_handler(httpd_req_t *req) {
 void startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.max_uri_handlers = 16;
+  config.send_wait_timeout = 3;     // un cliente muerto ya no bloquea el stream 5 s
+  config.recv_wait_timeout = 3;
+  config.lru_purge_enable = true;   // libera sockets viejos al reconectar la app
 
   httpd_uri_t index_uri = {
     .uri = "/",
